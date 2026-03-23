@@ -33,7 +33,10 @@ pub struct SpinThenWait {
 
 impl Default for SpinThenWait {
     fn default() -> Self {
-        Self { spin_count: 256 }
+        // ベンチマークで 512 が最速 (64B PingPong で 1.7µs)。
+        // 256 以下だと futex に落ちる頻度が高く 2µs+ になる。
+        // 1024 以上に増やしても改善せず、CPU 空回りが増えるだけ。
+        Self { spin_count: 512 }
     }
 }
 
