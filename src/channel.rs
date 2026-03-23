@@ -96,8 +96,10 @@ impl Channel {
             let rh = unsafe { &mut *(base.add(ring_header_offset) as *mut RingHeader) };
             rh.writer.write_cursor.store(0, Ordering::Release);
             rh.writer.notify.store(0, Ordering::Release);
+            rh.writer.parked.store(0, Ordering::Release);
             rh.reader.read_cursor.store(0, Ordering::Release);
             rh.reader.notify.store(0, Ordering::Release);
+            rh.reader.parked.store(0, Ordering::Release);
         }
 
         // state を ServerReady にする (Release: 上の全初期化が先に見えることを保証)

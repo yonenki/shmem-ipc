@@ -90,10 +90,13 @@ impl GlobalHeader {
 ///
 /// writer のみが write_cursor を更新し、reader は読むだけ。
 /// notify は writer が書き込み後に increment する futex ワード。
+/// parked は reader が futex_wait に入る直前に 1 にし、抜けたら 0 にする。
+/// writer は parked == 1 のときだけ futex_wake を呼ぶ (syscall 省略)。
 #[repr(C, align(64))]
 pub struct WriteCursorLine {
     pub write_cursor: AtomicU64,
     pub notify: AtomicU32,
+    pub parked: AtomicU32,
     // 残りは 64 bytes までパディング
 }
 
@@ -101,10 +104,12 @@ pub struct WriteCursorLine {
 ///
 /// reader のみが read_cursor を更新し、writer は読むだけ。
 /// notify は reader が読み取り後に increment する futex ワード。
+/// parked は writer が futex_wait に入る直前に 1 にし、抜けたら 0 にする。
 #[repr(C, align(64))]
 pub struct ReadCursorLine {
     pub read_cursor: AtomicU64,
     pub notify: AtomicU32,
+    pub parked: AtomicU32,
     // 残りは 64 bytes までパディング
 }
 

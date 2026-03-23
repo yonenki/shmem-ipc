@@ -10,43 +10,28 @@ pub const DEFAULT_RING_DATA_SIZE: usize = 16 * 1024 * 1024;
 /// メッセージヘッダ: 4 bytes (length) + 4 bytes (sequence number)
 pub const MSG_HEADER_SIZE: usize = 8;
 
-/// SPSC リングバッファの送信側
-///
-/// 1つのリング方向に対して1つの RingSender が存在する。
-/// Send を実装するが Sync は実装しない (SPSC: 1 writer のみ)。
+// =========================================================================
+// RingSender
+// =========================================================================
+
 pub struct RingSender {
     base: *mut u8,
     ring_header: *const RingHeader,
     global_header: *const GlobalHeader,
     data_offset: usize,
     ring_data_size: usize,
-    ring_mask: usize, // ring_data_size - 1 (2の累乗前提でモジュロを高速化)
+    ring_mask: usize,
     next_seq: u32,
+    // 最適化 #3: 自分のカーソルをローカルにキャッシュ
+    // write_cursor は自分だけが書くので Atomic load 不要
+    cached_wc: u64,
+    // peer の read_cursor のキャッシュ。空きが足りないときだけ更新
+    cached_rc: u64,
 }
 
 unsafe impl Send for RingSender {}
 
-/// SPSC リングバッファの受信側
-///
-/// Send を実装するが Sync は実装しない (SPSC: 1 reader のみ)。
-pub struct RingReceiver {
-    base: *const u8,
-    ring_header: *const RingHeader,
-    global_header: *const GlobalHeader,
-    data_offset: usize,
-    ring_data_size: usize,
-    ring_mask: usize,
-    expected_seq: u32,
-}
-
-unsafe impl Send for RingReceiver {}
-
 impl RingSender {
-    /// RingSender を構築する
-    ///
-    /// # Safety
-    /// - base は有効な mmap ポインタで、ring_header と data_offset の範囲が mmap 内に収まること
-    /// - ring_data_size は 2 の累乗であること
     pub unsafe fn new(
         base: *mut u8,
         ring_header: *const RingHeader,
@@ -63,21 +48,17 @@ impl RingSender {
             ring_data_size,
             ring_mask: ring_data_size - 1,
             next_seq: 1,
+            cached_wc: 0,
+            cached_rc: 0,
         }
     }
 
-    /// メッセージを送信する
-    ///
-    /// payload を [length:u32 LE][seq:u32 LE][payload] のフレームとしてリングに書き込む。
-    /// リングに空きがなければ WaitStrategy で待機する。
     pub fn send(
         &mut self,
         payload: &[u8],
         wait: &impl WaitStrategy,
         timeout: Option<std::time::Duration>,
     ) -> Result<()> {
-        // close 済みチャネルへの送信を拒否
-        // (drain セマンティクスは recv 側のみ — send は即エラー)
         self.check_channel_active()?;
 
         let msg_len = MSG_HEADER_SIZE + payload.len();
@@ -88,23 +69,41 @@ impl RingSender {
             });
         }
 
-        // リングに空きができるまで待機
-        // 空きを先にチェックし、空きがないときだけ close を検出
-        let wc = wait.wait_until(
-            self.reader_notify(),
-            timeout,
-            || {
-                let wc = self.write_cursor().load(Ordering::Relaxed);
-                let rc = self.read_cursor().load(Ordering::Acquire);
-                let free = self.ring_data_size as u64 - (wc - rc);
-                if free >= msg_len as u64 {
-                    Ok(Some(wc))
-                } else {
-                    self.check_channel_active()?;
-                    Ok(None)
-                }
-            },
-        )?;
+        let wc = self.cached_wc;
+
+        // 最適化 #3: キャッシュ済み rc でまず空きをチェック
+        let free = self.ring_data_size as u64 - (wc - self.cached_rc);
+        if (free as usize) < msg_len {
+            // キャッシュが古い → shared memory から最新 rc を取得して待機
+            // borrow checker のため、self のフィールドを個別に参照
+            let ring_header = self.ring_header;
+            let global_header = self.global_header;
+            let ring_data_size = self.ring_data_size;
+            let read_cursor = unsafe { &(*ring_header).reader.read_cursor };
+            let reader_notify = unsafe { &(*ring_header).reader.notify };
+            let reader_parked = unsafe { &(*ring_header).reader.parked };
+            let state = unsafe { &(*global_header).state };
+
+            let new_rc = wait.wait_until(
+                reader_notify,
+                reader_parked,
+                timeout,
+                || {
+                    let rc = read_cursor.load(Ordering::Acquire);
+                    let free = ring_data_size as u64 - (wc - rc);
+                    if free >= msg_len as u64 {
+                        Ok(Some(rc))
+                    } else {
+                        let s = state.load(Ordering::Acquire);
+                        match ChannelState::from_u32(s) {
+                            Some(s) if s.is_active() => Ok(None),
+                            _ => Err(Error::ChannelClosed),
+                        }
+                    }
+                },
+            )?;
+            self.cached_rc = new_rc;
+        }
 
         // フレームを書き込む
         let len_bytes = (payload.len() as u32).to_le_bytes();
@@ -113,19 +112,19 @@ impl RingSender {
         self.write_ring(wc + 4, &seq_bytes);
         self.write_ring(wc + MSG_HEADER_SIZE as u64, payload);
 
-        // write_cursor を進める (Release: 上のデータ書き込みが先に見えることを保証)
-        self.write_cursor()
-            .store(wc + msg_len as u64, Ordering::Release);
+        // write_cursor を進める (Release)
+        let new_wc = wc + msg_len as u64;
+        self.write_cursor().store(new_wc, Ordering::Release);
+        self.cached_wc = new_wc;
         self.next_seq = self.next_seq.wrapping_add(1);
 
-        // reader を起こす
+        // 最適化 #1: notify bump + parked のときだけ wake
         self.writer_notify().fetch_add(1, Ordering::Release);
-        platform::futex_wake(self.writer_notify());
+        wait.wake_if_parked(self.writer_notify(), self.writer_parked());
 
         Ok(())
     }
 
-    /// wrap-around 対応のリング書き込み
     fn write_ring(&self, cursor: u64, data: &[u8]) {
         let start = (cursor as usize) & self.ring_mask;
         let first_len = data.len().min(self.ring_data_size - start);
@@ -148,19 +147,11 @@ impl RingSender {
     fn write_cursor(&self) -> &AtomicU64 {
         unsafe { &(*self.ring_header).writer.write_cursor }
     }
-
-    fn read_cursor(&self) -> &AtomicU64 {
-        unsafe { &(*self.ring_header).reader.read_cursor }
-    }
-
-    /// writer 側の notify (reader がこれを watch して起きる)
     fn writer_notify(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).writer.notify }
     }
-
-    /// reader 側の notify (writer がこれを watch して空きを待つ)
-    fn reader_notify(&self) -> &AtomicU32 {
-        unsafe { &(*self.ring_header).reader.notify }
+    fn writer_parked(&self) -> &AtomicU32 {
+        unsafe { &(*self.ring_header).writer.parked }
     }
 
     fn check_channel_active(&self) -> Result<()> {
@@ -172,12 +163,25 @@ impl RingSender {
     }
 }
 
+// =========================================================================
+// RingReceiver
+// =========================================================================
+
+pub struct RingReceiver {
+    base: *const u8,
+    ring_header: *const RingHeader,
+    global_header: *const GlobalHeader,
+    data_offset: usize,
+    ring_data_size: usize,
+    ring_mask: usize,
+    expected_seq: u32,
+    // 最適化 #3: 自分の read_cursor をローカルにキャッシュ
+    cached_rc: u64,
+}
+
+unsafe impl Send for RingReceiver {}
+
 impl RingReceiver {
-    /// RingReceiver を構築する
-    ///
-    /// # Safety
-    /// - base は有効な mmap ポインタで、ring_header と data_offset の範囲が mmap 内に収まること
-    /// - ring_data_size は 2 の累乗であること
     pub unsafe fn new(
         base: *const u8,
         ring_header: *const RingHeader,
@@ -194,10 +198,10 @@ impl RingReceiver {
             ring_data_size,
             ring_mask: ring_data_size - 1,
             expected_seq: 1,
+            cached_rc: 0,
         }
     }
 
-    /// メッセージを受信する (Vec<u8> を返す)
     pub fn recv(
         &mut self,
         wait: &impl WaitStrategy,
@@ -208,21 +212,10 @@ impl RingReceiver {
         let mut buf = vec![0u8; data_len];
         self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf);
 
-        // read_cursor を進める
-        let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
-        self.read_cursor().store(rc + msg_len, Ordering::Release);
-
-        // writer を起こす (空きができたことを通知)
-        self.reader_notify().fetch_add(1, Ordering::Release);
-        platform::futex_wake(self.reader_notify());
-
+        self.advance_cursor(rc, data_len, wait);
         Ok(buf)
     }
 
-    /// 呼び出し元のバッファに受信する
-    ///
-    /// バッファサイズがメッセージより小さい場合は MessageTooLarge エラーを返す。
-    /// サイレントな切り詰めは行わない。
     pub fn recv_into(
         &mut self,
         buf: &mut [u8],
@@ -232,11 +225,7 @@ impl RingReceiver {
         let (rc, data_len) = self.wait_for_message(wait, timeout)?;
 
         if data_len > buf.len() {
-            // カーソルを進めてメッセージを消費する (さもないとリングが詰まる)
-            let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
-            self.read_cursor().store(rc + msg_len, Ordering::Release);
-            self.reader_notify().fetch_add(1, Ordering::Release);
-            platform::futex_wake(self.reader_notify());
+            self.advance_cursor(rc, data_len, wait);
             return Err(Error::MessageTooLarge {
                 size: data_len,
                 max: buf.len(),
@@ -244,20 +233,13 @@ impl RingReceiver {
         }
 
         self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf[..data_len]);
-
-        let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
-        self.read_cursor().store(rc + msg_len, Ordering::Release);
-
-        self.reader_notify().fetch_add(1, Ordering::Release);
-        platform::futex_wake(self.reader_notify());
-
+        self.advance_cursor(rc, data_len, wait);
         Ok(data_len)
     }
 
-    /// ノンブロッキング受信
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
         let wc = self.write_cursor().load(Ordering::Acquire);
-        let rc = self.read_cursor().load(Ordering::Relaxed);
+        let rc = self.cached_rc;
 
         if wc - rc < MSG_HEADER_SIZE as u64 {
             return Ok(None);
@@ -265,7 +247,6 @@ impl RingReceiver {
 
         let (data_len, seq) = self.read_msg_header(rc);
 
-        // data_len の妥当性チェック (recv/recv_into と同じガード)
         if data_len > self.ring_data_size - MSG_HEADER_SIZE {
             return Err(Error::MessageTooLarge {
                 size: data_len,
@@ -273,9 +254,11 @@ impl RingReceiver {
             });
         }
 
+        // 最適化 #2: write_cursor が進んだ = フレーム全体が書き込み済み
+        // 2段階チェック不要。ただし部分フレームは corruption として扱う
         let msg_len = MSG_HEADER_SIZE + data_len;
         if wc - rc < msg_len as u64 {
-            return Ok(None); // ヘッダは見えるがペイロードがまだ
+            return Ok(None);
         }
 
         self.validate_seq(seq)?;
@@ -283,45 +266,46 @@ impl RingReceiver {
         let mut buf = vec![0u8; data_len];
         self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf);
 
-        self.read_cursor()
-            .store(rc + msg_len as u64, Ordering::Release);
+        let new_rc = rc + msg_len as u64;
+        self.read_cursor().store(new_rc, Ordering::Release);
+        self.cached_rc = new_rc;
         self.reader_notify().fetch_add(1, Ordering::Release);
+        // try_recv は非ブロッキングなので wake は常に呼ぶ (parked チェック省略)
         platform::futex_wake(self.reader_notify());
 
         Ok(Some(buf))
     }
 
-    /// メッセージヘッダ (length + seq) が来るまで待ち、ペイロード全体が揃うまで待つ
+    /// 最適化 #2: 1段階 wait (write_cursor が進んだ = フレーム完成)
+    ///
+    /// writer は header + payload を全て書いてから write_cursor を Release store する。
+    /// よって write_cursor - read_cursor >= MSG_HEADER_SIZE ならフレーム全体が見える。
+    /// 2段階目の "payload 全体が来るまで待つ" は不要。
     fn wait_for_message(
         &mut self,
         wait: &impl WaitStrategy,
         timeout: Option<std::time::Duration>,
     ) -> Result<(u64, usize)> {
-        // Phase 1: length ヘッダが来るまで待つ
-        //
-        // データの存在を先にチェックし、close 状態はリングが空のときだけ返す。
-        // これにより、peer が send 直後に drop してもバッファ済みデータを受信できる。
-        let rc = wait.wait_until(
+        let rc = self.cached_rc;
+
+        // write_cursor が十分進むまで待つ (1段階のみ)
+        let wc = wait.wait_until(
             self.writer_notify(),
+            self.writer_parked(),
             timeout,
             || {
                 let wc = self.write_cursor().load(Ordering::Acquire);
-                let rc = self.read_cursor().load(Ordering::Relaxed);
                 if wc - rc >= MSG_HEADER_SIZE as u64 {
-                    Ok(Some(rc))
+                    Ok(Some(wc))
                 } else {
-                    // リングが空の場合のみ close を検出
                     self.check_channel_active()?;
                     Ok(None)
                 }
             },
         )?;
 
-        // length + seq を読む
         let (data_len, seq) = self.read_msg_header(rc);
-        let msg_len = MSG_HEADER_SIZE + data_len;
 
-        // data_len の妥当性チェック: リングサイズを超える値は破損データ
         if data_len > self.ring_data_size - MSG_HEADER_SIZE {
             return Err(Error::MessageTooLarge {
                 size: data_len,
@@ -329,27 +313,27 @@ impl RingReceiver {
             });
         }
 
-        // Phase 2: ペイロード全体が来るまで待つ
-        wait.wait_until(
-            self.writer_notify(),
-            timeout,
-            || {
-                let wc = self.write_cursor().load(Ordering::Acquire);
-                if wc - rc >= msg_len as u64 {
-                    Ok(Some(()))
-                } else {
-                    self.check_channel_active()?;
-                    Ok(None)
-                }
-            },
-        )?;
+        // フレーム全体が見えるか検証 (write_cursor はフレーム完成後に進むので通常は成立)
+        let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
+        debug_assert!(
+            wc - rc >= msg_len,
+            "partial frame visible: wc={wc}, rc={rc}, msg_len={msg_len}"
+        );
 
         self.validate_seq(seq)?;
-
         Ok((rc, data_len))
     }
 
-    /// メッセージヘッダ (length + sequence) を読む
+    /// read_cursor を進めて writer を (必要なら) 起こす
+    fn advance_cursor(&mut self, rc: u64, data_len: usize, wait: &impl WaitStrategy) {
+        let new_rc = rc + (MSG_HEADER_SIZE + data_len) as u64;
+        self.read_cursor().store(new_rc, Ordering::Release);
+        self.cached_rc = new_rc;
+
+        self.reader_notify().fetch_add(1, Ordering::Release);
+        wait.wake_if_parked(self.reader_notify(), self.reader_parked());
+    }
+
     fn read_msg_header(&self, cursor: u64) -> (usize, u32) {
         let mut header = [0u8; MSG_HEADER_SIZE];
         self.read_ring(cursor, &mut header);
@@ -358,7 +342,6 @@ impl RingReceiver {
         (data_len, seq)
     }
 
-    /// シーケンス番号を検証する
     fn validate_seq(&mut self, seq: u32) -> Result<()> {
         if seq != self.expected_seq {
             return Err(Error::SequenceMismatch {
@@ -370,7 +353,6 @@ impl RingReceiver {
         Ok(())
     }
 
-    /// wrap-around 対応のリング読み出し
     fn read_ring(&self, cursor: u64, buf: &mut [u8]) {
         let start = (cursor as usize) & self.ring_mask;
         let first_len = buf.len().min(self.ring_data_size - start);
@@ -393,17 +375,20 @@ impl RingReceiver {
     fn write_cursor(&self) -> &AtomicU64 {
         unsafe { &(*self.ring_header).writer.write_cursor }
     }
-
     fn read_cursor(&self) -> &AtomicU64 {
         unsafe { &(*self.ring_header).reader.read_cursor }
     }
-
     fn writer_notify(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).writer.notify }
     }
-
+    fn writer_parked(&self) -> &AtomicU32 {
+        unsafe { &(*self.ring_header).writer.parked }
+    }
     fn reader_notify(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).reader.notify }
+    }
+    fn reader_parked(&self) -> &AtomicU32 {
+        unsafe { &(*self.ring_header).reader.parked }
     }
 
     fn check_channel_active(&self) -> Result<()> {

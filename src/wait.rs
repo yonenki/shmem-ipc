@@ -5,37 +5,41 @@ use crate::error::{Error, Result};
 use crate::platform;
 
 /// ブロッキング戦略の trait
-///
-/// condition クロージャが `Ok(Some(value))` を返すまで待機する。
-/// `Ok(None)` はまだ条件を満たさないことを意味する。
-/// `Err(...)` は即座にエラーとして返される (ChannelClosed 検知など)。
 pub trait WaitStrategy: Send + Sync {
+    /// condition が Ok(Some(val)) を返すまで待機する。
+    /// notify: 相手が bump する futex ワード
+    /// parked: 自分が futex に入っていることを相手に伝えるフラグ
     fn wait_until<T, F>(
         &self,
         notify: &AtomicU32,
+        parked: &AtomicU32,
         timeout: Option<Duration>,
         condition: F,
     ) -> Result<T>
     where
         F: Fn() -> Result<Option<T>>;
+
+    /// 相手が parked していれば futex_wake を呼ぶ。していなければ何もしない。
+    fn wake_if_parked(&self, notify: &AtomicU32, parked: &AtomicU32) {
+        // notify は既に bump 済みの前提で呼ばれる
+        if parked.load(Ordering::Acquire) != 0 {
+            platform::futex_wake(notify);
+        }
+    }
+
+    /// 強制 wake (close 時)。parked に関わらず呼ぶ。
+    fn wake_force(&self, notify: &AtomicU32) {
+        platform::futex_wake(notify);
+    }
 }
 
 /// Spin → Futex フォールバック戦略 (製品デフォルト)
-///
-/// 1. spin_count 回だけ spin_loop() で回る (最低レイテンシ)
-/// 2. それでもダメならカーネルの futex/WaitOnAddress に寝かせてもらう (CPU 節約)
-///
-/// futex_wait は notify ワードの値が変わっていなければスリープし、
-/// 相手が futex_wake を呼ぶと起きる。
 pub struct SpinThenWait {
     pub spin_count: u32,
 }
 
 impl Default for SpinThenWait {
     fn default() -> Self {
-        // ベンチマークで 512 が最速 (64B PingPong で 1.7µs)。
-        // 256 以下だと futex に落ちる頻度が高く 2µs+ になる。
-        // 1024 以上に増やしても改善せず、CPU 空回りが増えるだけ。
         Self { spin_count: 512 }
     }
 }
@@ -44,13 +48,14 @@ impl WaitStrategy for SpinThenWait {
     fn wait_until<T, F>(
         &self,
         notify: &AtomicU32,
+        parked: &AtomicU32,
         timeout: Option<Duration>,
         condition: F,
     ) -> Result<T>
     where
         F: Fn() -> Result<Option<T>>,
     {
-        // Phase 1: Spin
+        // Phase 1: Spin (syscall なし、最低レイテンシ)
         for _ in 0..self.spin_count {
             match condition()? {
                 Some(val) => return Ok(val),
@@ -58,29 +63,11 @@ impl WaitStrategy for SpinThenWait {
             }
         }
 
-        // Phase 2: Futex
-        //
-        // 重要: snapshot を condition チェックの *前* に取る。
-        //
-        // 誤った順序 (condition → snapshot → futex_wait):
-        //   1. condition() → None (データまだない)
-        //   2. 相手がデータ publish + notify bump + futex_wake
-        //   3. snapshot = notify.load() → 新しい値 V+1
-        //   4. futex_wait(notify, V+1) → 値が一致するのでスリープ
-        //   5. 相手は応答待ちなので wake が来ない → デッドロック
-        //
-        // 正しい順序 (snapshot → condition → futex_wait):
-        //   1. snapshot = notify.load() → 現在の値 V
-        //   2. condition() → None
-        //   3. 相手がデータ publish + notify bump (V → V+1) + futex_wake
-        //   4. futex_wait(notify, V) → *notify(=V+1) != V なので即リターン (EAGAIN)
-        //   5. ループで condition() を再チェック → データあり → 成功
+        // Phase 2: Futex (parked フラグで相手に通知)
         let deadline = timeout.map(|d| Instant::now() + d);
         loop {
-            // snapshot を先に取る
             let snapshot = notify.load(Ordering::Acquire);
 
-            // condition チェック
             match condition()? {
                 Some(val) => return Ok(val),
                 None => {}
@@ -97,24 +84,32 @@ impl WaitStrategy for SpinThenWait {
                 None => None,
             };
 
-            // snapshot 時点の値で futex_wait。
-            // もし snapshot 後に notify が bump されていれば、
-            // futex_wait は即座に EAGAIN でリターンする。
+            // parked = 1: 「自分は寝る」と宣言
+            parked.store(1, Ordering::Release);
+
+            // 宣言後にもう一度チェック (parked セット前に相手が publish した場合を拾う)
+            match condition()? {
+                Some(val) => {
+                    parked.store(0, Ordering::Relaxed);
+                    return Ok(val);
+                }
+                None => {}
+            }
+
             platform::futex_wait(notify, snapshot, remaining);
+            parked.store(0, Ordering::Relaxed);
         }
     }
 }
 
 /// 純 Spin 戦略 (ベンチマーク用)
-///
-/// ipc-bench 互換。CPU を 100% 使うが最低レイテンシ。
-/// タイムアウトチェックは 1024 イテレーションごと (clock_gettime のコスト回避)。
 pub struct SpinOnly;
 
 impl WaitStrategy for SpinOnly {
     fn wait_until<T, F>(
         &self,
         _notify: &AtomicU32,
+        _parked: &AtomicU32,
         timeout: Option<Duration>,
         condition: F,
     ) -> Result<T>
@@ -130,7 +125,6 @@ impl WaitStrategy for SpinOnly {
             }
             iter = iter.wrapping_add(1);
             if let Some(dl) = deadline {
-                // 1024 回ごとに時刻確認 (毎回だと clock_gettime のコストが支配的になる)
                 if iter & 0x3FF == 0 && Instant::now() >= dl {
                     return Err(Error::TimedOut);
                 }
