@@ -1,0 +1,196 @@
+use std::thread;
+use std::time::{Duration, Instant};
+
+use shmem_ipc::{Channel, ChannelState, Error};
+
+/// 基本的な send/recv
+#[test]
+fn test_basic_send_recv() {
+    let name = "test_basic";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        let msg = client.recv().unwrap();
+        assert_eq!(msg, b"hello");
+        client.send(b"world").unwrap();
+    });
+
+    server.send(b"hello").unwrap();
+    let reply = server.recv().unwrap();
+    assert_eq!(reply, b"world");
+
+    handle.join().unwrap();
+}
+
+/// 複数メッセージの送受信
+#[test]
+fn test_multiple_messages() {
+    let name = "test_multi";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        for i in 0u32..100 {
+            let msg = client.recv().unwrap();
+            let expected = i.to_le_bytes();
+            assert_eq!(msg, expected);
+        }
+        client.send(b"done").unwrap();
+    });
+
+    for i in 0u32..100 {
+        server.send(&i.to_le_bytes()).unwrap();
+    }
+    let reply = server.recv().unwrap();
+    assert_eq!(reply, b"done");
+
+    handle.join().unwrap();
+}
+
+/// 大きなメッセージ
+#[test]
+fn test_large_message() {
+    let name = "test_large";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let data = vec![0xABu8; 1024 * 1024]; // 1MB
+    let data_clone = data.clone();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        let msg = client.recv().unwrap();
+        assert_eq!(msg, data_clone);
+    });
+
+    server.send(&data).unwrap();
+    handle.join().unwrap();
+}
+
+/// recv_timeout のタイムアウト
+#[test]
+fn test_recv_timeout() {
+    let name = "test_timeout";
+    let _ = Channel::cleanup(name);
+
+    let _server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        let result = client.recv_timeout(Duration::from_millis(50));
+        assert!(matches!(result, Err(Error::TimedOut)));
+    });
+
+    // server は何も送らない → client がタイムアウト
+    // handle.join() が client スレッドの完了を待つので sleep は不要
+    handle.join().unwrap();
+}
+
+/// try_recv のノンブロッキング動作
+#[test]
+fn test_try_recv() {
+    let name = "test_try_recv";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+
+        // まだ何も来ていない
+        let result = client.try_recv().unwrap();
+        assert!(result.is_none());
+
+        // データが届くまでポーリング (タイミング依存の sleep を排除)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let msg = loop {
+            if let Some(msg) = client.try_recv().unwrap() {
+                break msg;
+            }
+            assert!(Instant::now() < deadline, "try_recv timed out waiting for message");
+            thread::yield_now();
+        };
+        assert_eq!(msg, b"ping");
+    });
+
+    // client が open して最初の try_recv(None) を呼ぶのを待つため少し間を空ける
+    // これは try_recv の「データなし」パスをテストするために必要な最小限の待ち
+    thread::sleep(Duration::from_millis(10));
+    server.send(b"ping").unwrap();
+    handle.join().unwrap();
+}
+
+/// Drop でチャネルが閉じられる
+#[test]
+fn test_drop_closes_channel() {
+    let name = "test_drop";
+    let _ = Channel::cleanup(name);
+
+    let server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        // server が drop された後に recv → ChannelClosed
+        let result = client.recv_timeout(Duration::from_secs(2));
+        assert!(
+            matches!(result, Err(Error::ChannelClosed)),
+            "expected ChannelClosed, got: {:?}",
+            result
+        );
+    });
+
+    // sleep ではなく state が Connected になるのを待つ (client が open を完了した証拠)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if server.state() == ChannelState::Connected {
+            break;
+        }
+        assert!(Instant::now() < deadline, "client did not connect in time");
+        thread::yield_now();
+    }
+    drop(server);
+
+    handle.join().unwrap();
+}
+
+/// PingPong パフォーマンステスト (回帰テスト用)
+#[test]
+fn test_ping_pong_performance() {
+    let name = "test_perf";
+    let _ = Channel::cleanup(name);
+
+    let count = 10_000;
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        let mut buf = vec![0u8; 64];
+        for _ in 0..count {
+            let n = client.recv_into(&mut buf).unwrap();
+            client.send(&buf[..n]).unwrap();
+        }
+    });
+
+    let msg = vec![0xABu8; 64];
+    let start = Instant::now();
+    for _ in 0..count {
+        server.send(&msg).unwrap();
+        let reply = server.recv().unwrap();
+        assert_eq!(reply, msg, "echo data mismatch");
+    }
+    let elapsed = start.elapsed();
+    let throughput = (64 * count * 2) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+
+    println!(
+        "PingPong {count} x 64B: {:.2?} ({:.1} MB/s)",
+        elapsed, throughput
+    );
+
+    handle.join().unwrap();
+}

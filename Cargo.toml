@@ -1,0 +1,14 @@
+[package]
+name = "shmem-ipc"
+version = "0.1.0"
+edition = "2024"
+description = "Production-quality shared memory IPC with lock-free SPSC ring buffers"
+
+[dependencies]
+memmap2 = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
