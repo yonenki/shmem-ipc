@@ -265,6 +265,14 @@ impl RingReceiver {
 
         let (data_len, seq) = self.read_msg_header(rc);
 
+        // data_len の妥当性チェック (recv/recv_into と同じガード)
+        if data_len > self.ring_data_size - MSG_HEADER_SIZE {
+            return Err(Error::MessageTooLarge {
+                size: data_len,
+                max: self.ring_data_size - MSG_HEADER_SIZE,
+            });
+        }
+
         let msg_len = MSG_HEADER_SIZE + data_len;
         if wc - rc < msg_len as u64 {
             return Ok(None); // ヘッダは見えるがペイロードがまだ
