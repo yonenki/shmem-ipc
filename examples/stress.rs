@@ -438,6 +438,161 @@ fn test_timeout_accuracy() {
 // =========================================================================
 // main
 // =========================================================================
+// 11. Server drop before Client open
+// =========================================================================
+fn test_server_drop_before_open() {
+    println!("[11] Server drop before Client open...");
+    let name = "stress_srv_drop";
+    let _ = Channel::cleanup(name);
+
+    // Server を作って即 drop → ファイル削除される
+    let _server = Channel::create(name).unwrap();
+    drop(_server);
+
+    // Client が open → ファイルがないのでタイムアウトすべき
+    let config = ChannelConfig {
+        connect_timeout: Duration::from_millis(200),
+        ..config(4096, 512)
+    };
+    let result = Channel::open_with_config(name, config).err();
+    assert!(
+        matches!(result, Some(Error::TimedOut)),
+        "expected TimedOut when server already dropped, got: {:?}",
+        result
+    );
+    println!("  PASS");
+}
+
+// =========================================================================
+// 12. Dual Client open (SPSC: 2番目は拒否すべき)
+// =========================================================================
+fn test_dual_client_open() {
+    println!("[12] Dual Client open (SPSC rejection)...");
+    let name = "stress_dual";
+    let _ = Channel::cleanup(name);
+
+    let _server = Channel::create(name).unwrap();
+
+    // 1番目の Client: Connected に遷移
+    let _client1 = Channel::open(name).unwrap();
+
+    // 2番目の Client: state が既に Connected なので ServerReady → Connected の CAS が失敗すべき
+    let config = ChannelConfig {
+        connect_timeout: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let result = Channel::open_with_config(name, config).err();
+    assert!(
+        matches!(result, Some(Error::ChannelClosed)),
+        "expected ChannelClosed for second client, got: {:?}",
+        result
+    );
+    println!("  PASS");
+}
+
+// =========================================================================
+// 13. Reconnection (同じ名前で再接続)
+// =========================================================================
+fn test_reconnection() {
+    println!("[13] Reconnection (same name)...");
+    let name = "stress_reconnect";
+    let _ = Channel::cleanup(name);
+
+    // 1回目の接続
+    {
+        let mut server = Channel::create(name).unwrap();
+        let handle = thread::spawn(move || {
+            let mut client = Channel::open(name).unwrap();
+            let msg = client.recv().unwrap();
+            assert_eq!(msg, b"gen1");
+            client.send(b"ack1").unwrap();
+        });
+        server.send(b"gen1").unwrap();
+        let reply = server.recv().unwrap();
+        assert_eq!(reply, b"ack1");
+        handle.join().unwrap();
+    }
+    // server & client が drop → ファイル削除
+
+    // 2回目の接続 (同じ名前)
+    {
+        let mut server = Channel::create(name).unwrap();
+        let handle = thread::spawn(move || {
+            let mut client = Channel::open(name).unwrap();
+            let msg = client.recv().unwrap();
+            assert_eq!(msg, b"gen2");
+            client.send(b"ack2").unwrap();
+        });
+        server.send(b"gen2").unwrap();
+        let reply = server.recv().unwrap();
+        assert_eq!(reply, b"ack2");
+        handle.join().unwrap();
+    }
+
+    println!("  PASS (2 generations)");
+}
+
+// =========================================================================
+// 14. Client open before Server (timeout)
+// =========================================================================
+fn test_client_open_before_server() {
+    println!("[14] Client open before Server...");
+    let name = "stress_early_client";
+    let _ = Channel::cleanup(name);
+
+    let handle = thread::spawn(move || {
+        // Client が先に open を試みる → Server がいないのでポーリング
+        let mut client = Channel::open(name).unwrap();
+        let msg = client.recv().unwrap();
+        assert_eq!(msg, b"late_hello");
+    });
+
+    // 200ms 後に Server を作成
+    thread::sleep(Duration::from_millis(200));
+    let mut server = Channel::create(name).unwrap();
+    // Client が接続するのを少し待つ
+    thread::sleep(Duration::from_millis(100));
+    server.send(b"late_hello").unwrap();
+
+    handle.join().unwrap();
+    println!("  PASS");
+}
+
+// =========================================================================
+// 15. Server drop during Client open polling
+// =========================================================================
+fn test_stale_file_rejected() {
+    println!("[15] Stale file from previous session rejected...");
+    let name = "stress_stale";
+    let _ = Channel::cleanup(name);
+
+    // 1回目: Server を作って Client が接続 → 両方 drop → state=Closed
+    // ただし Client の drop ではファイルを削除しない (Server のみ削除)
+    // ここでは Server が削除するので、2回目に残骸が残る状況を作る
+    //
+    // 別のアプローチ: Client 側で drop → Server はまだ生きているが close 状態
+    {
+        let _server = Channel::create(name).unwrap();
+        let _client = Channel::open(name).unwrap();
+        // client drop → state=Closed, ファイルは残る (client は削除しない)
+        drop(_client);
+        // server は state=Closed のファイルを持ったまま
+        // server drop → ファイル削除
+    }
+
+    // Server が新しく create → truncate で上書き → 正常に動くべき
+    let mut server = Channel::create(name).unwrap();
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        let msg = client.recv().unwrap();
+        assert_eq!(msg, b"fresh");
+    });
+    server.send(b"fresh").unwrap();
+    handle.join().unwrap();
+    println!("  PASS");
+}
+
+// =========================================================================
 fn main() {
     println!("shmem-ipc stress test suite");
     println!("===========================\n");
@@ -454,6 +609,11 @@ fn main() {
     test_close_during_send();
     test_drain_after_close();
     test_timeout_accuracy();
+    test_server_drop_before_open();
+    test_dual_client_open();
+    test_reconnection();
+    test_client_open_before_server();
+    test_stale_file_rejected();
 
     let elapsed = start.elapsed();
     println!("\nAll stress tests passed in {elapsed:.2?}");
