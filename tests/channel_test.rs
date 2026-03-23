@@ -159,6 +159,98 @@ fn test_drop_closes_channel() {
     handle.join().unwrap();
 }
 
+// =========================================================================
+// 回帰テスト: Codex レビュー指摘事項
+// =========================================================================
+
+/// #2: close 後の send が ChannelClosed を返すこと (post-close write の防止)
+#[test]
+fn test_send_after_peer_close() {
+    let name = "test_send_after_close";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let client = Channel::open(name).unwrap();
+        // client を即 drop → state = Closed
+        drop(client);
+    });
+
+    handle.join().unwrap();
+
+    // peer が閉じた後の send は ChannelClosed を返すべき
+    let result = server.send(b"should fail");
+    assert!(
+        matches!(result, Err(Error::ChannelClosed)),
+        "expected ChannelClosed, got: {:?}",
+        result
+    );
+}
+
+/// #3: recv_into でバッファが小さい場合に MessageTooLarge エラー (サイレント切り詰め防止)
+#[test]
+fn test_recv_into_too_small_buffer() {
+    let name = "test_recv_into_small";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+
+        // 100 bytes のメッセージを受信しようとするが、バッファは 10 bytes
+        let mut small_buf = [0u8; 10];
+        let result = client.recv_into(&mut small_buf);
+        assert!(
+            matches!(result, Err(Error::MessageTooLarge { size: 100, max: 10 })),
+            "expected MessageTooLarge, got: {:?}",
+            result
+        );
+
+        // メッセージはリングから消費済みなので、次のメッセージは受信できる
+        let msg = client.recv().unwrap();
+        assert_eq!(msg, b"second");
+    });
+
+    server.send(&[0xABu8; 100]).unwrap();
+    server.send(b"second").unwrap();
+    handle.join().unwrap();
+}
+
+/// #4: drain セマンティクス — peer close 後もバッファ済みデータが受信できること
+#[test]
+fn test_drain_after_close() {
+    let name = "test_drain";
+    let _ = Channel::cleanup(name);
+
+    let mut server = Channel::create(name).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open(name).unwrap();
+        client.send(b"msg1").unwrap();
+        client.send(b"msg2").unwrap();
+        client.send(b"msg3").unwrap();
+        // client を drop → state = Closed
+        drop(client);
+    });
+
+    handle.join().unwrap();
+
+    // peer は閉じたが、バッファ済みの3メッセージは全て受信できるべき
+    assert_eq!(server.recv().unwrap(), b"msg1");
+    assert_eq!(server.recv().unwrap(), b"msg2");
+    assert_eq!(server.recv().unwrap(), b"msg3");
+
+    // バッファが空になったら ChannelClosed
+    let result = server.recv_timeout(Duration::from_millis(100));
+    assert!(
+        matches!(result, Err(Error::ChannelClosed)),
+        "expected ChannelClosed after drain, got: {:?}",
+        result
+    );
+}
+
 /// PingPong パフォーマンステスト (回帰テスト用)
 #[test]
 fn test_ping_pong_performance() {

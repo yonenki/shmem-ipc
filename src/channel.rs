@@ -167,9 +167,20 @@ impl Channel {
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        // ヘッダを検証
         let base = mmap.as_ptr() as *mut u8;
         let gh = unsafe { GlobalHeader::from_ptr(base as *const u8) };
+
+        // state を Acquire で先に読む。
+        // Server は magic/version/ring_data_size を plain store した後に
+        // state.store(ServerReady, Release) するので、ここで Acquire することで
+        // それらの plain store が確実に見える (happens-before 関係の確立)。
+        // ARM 等の弱いメモリモデルでは、この順序が正しさに必須。
+        let current_state = gh.state.load(Ordering::Acquire);
+        if current_state != ChannelState::ServerReady as u32 {
+            return Err(Error::ChannelClosed);
+        }
+
+        // Acquire の後なので plain fields は確実に最新値が見える
         gh.validate()?;
 
         if gh.ring_data_size as usize != config.ring_size {

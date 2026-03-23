@@ -76,6 +76,10 @@ impl RingSender {
         wait: &impl WaitStrategy,
         timeout: Option<std::time::Duration>,
     ) -> Result<()> {
+        // close 済みチャネルへの送信を拒否
+        // (drain セマンティクスは recv 側のみ — send は即エラー)
+        self.check_channel_active()?;
+
         let msg_len = MSG_HEADER_SIZE + payload.len();
         if msg_len > self.ring_data_size {
             return Err(Error::MessageTooLarge {
@@ -216,6 +220,9 @@ impl RingReceiver {
     }
 
     /// 呼び出し元のバッファに受信する
+    ///
+    /// バッファサイズがメッセージより小さい場合は MessageTooLarge エラーを返す。
+    /// サイレントな切り詰めは行わない。
     pub fn recv_into(
         &mut self,
         buf: &mut [u8],
@@ -224,8 +231,19 @@ impl RingReceiver {
     ) -> Result<usize> {
         let (rc, data_len) = self.wait_for_message(wait, timeout)?;
 
-        let read_len = data_len.min(buf.len());
-        self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf[..read_len]);
+        if data_len > buf.len() {
+            // カーソルを進めてメッセージを消費する (さもないとリングが詰まる)
+            let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
+            self.read_cursor().store(rc + msg_len, Ordering::Release);
+            self.reader_notify().fetch_add(1, Ordering::Release);
+            platform::futex_wake(self.reader_notify());
+            return Err(Error::MessageTooLarge {
+                size: data_len,
+                max: buf.len(),
+            });
+        }
+
+        self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf[..data_len]);
 
         let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
         self.read_cursor().store(rc + msg_len, Ordering::Release);
@@ -233,7 +251,7 @@ impl RingReceiver {
         self.reader_notify().fetch_add(1, Ordering::Release);
         platform::futex_wake(self.reader_notify());
 
-        Ok(read_len)
+        Ok(data_len)
     }
 
     /// ノンブロッキング受信
@@ -294,6 +312,14 @@ impl RingReceiver {
         // length + seq を読む
         let (data_len, seq) = self.read_msg_header(rc);
         let msg_len = MSG_HEADER_SIZE + data_len;
+
+        // data_len の妥当性チェック: リングサイズを超える値は破損データ
+        if data_len > self.ring_data_size - MSG_HEADER_SIZE {
+            return Err(Error::MessageTooLarge {
+                size: data_len,
+                max: self.ring_data_size - MSG_HEADER_SIZE,
+            });
+        }
 
         // Phase 2: ペイロード全体が来るまで待つ
         wait.wait_until(
