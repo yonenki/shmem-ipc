@@ -56,8 +56,28 @@ impl WaitStrategy for SpinThenWait {
         }
 
         // Phase 2: Futex
+        //
+        // 重要: snapshot を condition チェックの *前* に取る。
+        //
+        // 誤った順序 (condition → snapshot → futex_wait):
+        //   1. condition() → None (データまだない)
+        //   2. 相手がデータ publish + notify bump + futex_wake
+        //   3. snapshot = notify.load() → 新しい値 V+1
+        //   4. futex_wait(notify, V+1) → 値が一致するのでスリープ
+        //   5. 相手は応答待ちなので wake が来ない → デッドロック
+        //
+        // 正しい順序 (snapshot → condition → futex_wait):
+        //   1. snapshot = notify.load() → 現在の値 V
+        //   2. condition() → None
+        //   3. 相手がデータ publish + notify bump (V → V+1) + futex_wake
+        //   4. futex_wait(notify, V) → *notify(=V+1) != V なので即リターン (EAGAIN)
+        //   5. ループで condition() を再チェック → データあり → 成功
         let deadline = timeout.map(|d| Instant::now() + d);
         loop {
+            // snapshot を先に取る
+            let snapshot = notify.load(Ordering::Acquire);
+
+            // condition チェック
             match condition()? {
                 Some(val) => return Ok(val),
                 None => {}
@@ -74,12 +94,10 @@ impl WaitStrategy for SpinThenWait {
                 None => None,
             };
 
-            let snapshot = notify.load(Ordering::Acquire);
+            // snapshot 時点の値で futex_wait。
+            // もし snapshot 後に notify が bump されていれば、
+            // futex_wait は即座に EAGAIN でリターンする。
             platform::futex_wait(notify, snapshot, remaining);
-            // futex_wait の戻り値は無視:
-            // - 値が変わっていた (EAGAIN): condition を再チェック
-            // - タイムアウト: deadline で検出
-            // - シグナル割り込み: 再ループ
         }
     }
 }
