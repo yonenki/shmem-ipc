@@ -19,6 +19,7 @@ pub enum Role {
 }
 
 /// チャネルの設定
+#[derive(Clone)]
 pub struct ChannelConfig {
     /// リングバッファのデータ領域サイズ (2の累乗必須)。デフォルト: 16 MiB
     pub ring_size: usize,
@@ -285,6 +286,21 @@ impl Channel {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Channel を ShmemConnection に変換する
+    pub fn into_connection(self) -> crate::connection::ShmemConnection {
+        let is_server = self.role == Role::Server;
+        let name = self.name.clone();
+        let wait = SpinThenWait { spin_count: self.wait.spin_count };
+
+        // Drop を防ぐために分解
+        let mmap = unsafe { std::ptr::read(&self.mmap) };
+        let sender = unsafe { std::ptr::read(&self.sender) };
+        let receiver = unsafe { std::ptr::read(&self.receiver) };
+        std::mem::forget(self);
+
+        crate::connection::ShmemConnection::new(mmap, sender, receiver, wait, name, is_server)
     }
 
     fn global_header(&self) -> &GlobalHeader {

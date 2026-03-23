@@ -34,6 +34,7 @@ pub trait WaitStrategy: Send + Sync {
 }
 
 /// Spin → Futex フォールバック戦略 (製品デフォルト)
+#[derive(Clone)]
 pub struct SpinThenWait {
     pub spin_count: u32,
 }
