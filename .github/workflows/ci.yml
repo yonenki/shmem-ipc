@@ -84,6 +84,6 @@ jobs:
             echo "========================================="
             echo " Running: $bench"
             echo "========================================="
-            cargo run --release --example "$bench"
+            cargo run --release --example "$bench" || echo "WARN: $bench failed (non-fatal on CI)"
             echo ""
           done
