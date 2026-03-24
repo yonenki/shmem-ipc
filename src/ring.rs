@@ -84,24 +84,19 @@ impl RingSender {
             let reader_parked = unsafe { &(*ring_header).reader.parked };
             let state = unsafe { &(*global_header).state };
 
-            let new_rc = wait.wait_until(
-                reader_notify,
-                reader_parked,
-                timeout,
-                || {
-                    let rc = read_cursor.load(Ordering::Acquire);
-                    let free = ring_data_size as u64 - (wc - rc);
-                    if free >= msg_len as u64 {
-                        Ok(Some(rc))
-                    } else {
-                        let s = state.load(Ordering::Acquire);
-                        match ChannelState::from_u32(s) {
-                            Some(s) if s.is_active() => Ok(None),
-                            _ => Err(Error::ChannelClosed),
-                        }
+            let new_rc = wait.wait_until(reader_notify, reader_parked, timeout, || {
+                let rc = read_cursor.load(Ordering::Acquire);
+                let free = ring_data_size as u64 - (wc - rc);
+                if free >= msg_len as u64 {
+                    Ok(Some(rc))
+                } else {
+                    let s = state.load(Ordering::Acquire);
+                    match ChannelState::from_u32(s) {
+                        Some(s) if s.is_active() => Ok(None),
+                        _ => Err(Error::ChannelClosed),
                     }
-                },
-            )?;
+                }
+            })?;
             self.cached_rc = new_rc;
         }
 
@@ -289,20 +284,15 @@ impl RingReceiver {
         let rc = self.cached_rc;
 
         // write_cursor が十分進むまで待つ (1段階のみ)
-        let wc = wait.wait_until(
-            self.writer_notify(),
-            self.writer_parked(),
-            timeout,
-            || {
-                let wc = self.write_cursor().load(Ordering::Acquire);
-                if wc - rc >= MSG_HEADER_SIZE as u64 {
-                    Ok(Some(wc))
-                } else {
-                    self.check_channel_active()?;
-                    Ok(None)
-                }
-            },
-        )?;
+        let wc = wait.wait_until(self.writer_notify(), self.writer_parked(), timeout, || {
+            let wc = self.write_cursor().load(Ordering::Acquire);
+            if wc - rc >= MSG_HEADER_SIZE as u64 {
+                Ok(Some(wc))
+            } else {
+                self.check_channel_active()?;
+                Ok(None)
+            }
+        })?;
 
         let (data_len, seq) = self.read_msg_header(rc);
 

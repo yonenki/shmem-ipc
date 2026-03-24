@@ -200,12 +200,14 @@ fn test_mixed_sizes() {
         for cycle in 0..cycles {
             for (slot, &size) in sizes.iter().enumerate() {
                 let msg = client.recv().unwrap();
-                assert_eq!(msg.len(), size, "size mismatch at cycle={cycle} slot={slot}");
+                assert_eq!(
+                    msg.len(),
+                    size,
+                    "size mismatch at cycle={cycle} slot={slot}"
+                );
                 if size >= 8 {
-                    let got_cycle =
-                        u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
-                    let got_slot =
-                        u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
+                    let got_cycle = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
+                    let got_slot = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
                     assert_eq!(got_cycle, cycle);
                     assert_eq!(got_slot, slot);
                 }
@@ -403,8 +405,7 @@ fn test_timeout_accuracy() {
     let _server = Channel::create_with_config(name, config(16 * 1024 * 1024, 0)).unwrap();
 
     let handle = thread::spawn(move || {
-        let mut client =
-            Channel::open_with_config(name, config(16 * 1024 * 1024, 0)).unwrap();
+        let mut client = Channel::open_with_config(name, config(16 * 1024 * 1024, 0)).unwrap();
 
         let mut durations = Vec::new();
         let timeout = Duration::from_millis(5);
@@ -425,10 +426,7 @@ fn test_timeout_accuracy() {
             min >= Duration::from_millis(4),
             "timeout returned too early: {min:.2?}"
         );
-        assert!(
-            p50 < Duration::from_millis(15),
-            "p50 too high: {p50:.2?}"
-        );
+        assert!(p50 < Duration::from_millis(15), "p50 too high: {p50:.2?}");
     });
 
     handle.join().unwrap();

@@ -6,9 +6,9 @@ use std::time::Duration;
 use memmap2::MmapMut;
 
 use crate::error::{Error, Result};
-use crate::header::{ChannelState, GlobalHeader, RingHeader, RingOffsets, MAGIC, VERSION};
+use crate::header::{ChannelState, GlobalHeader, MAGIC, RingHeader, RingOffsets, VERSION};
 use crate::platform;
-use crate::ring::{RingReceiver, RingSender, DEFAULT_RING_DATA_SIZE};
+use crate::ring::{DEFAULT_RING_DATA_SIZE, RingReceiver, RingSender};
 use crate::wait::SpinThenWait;
 
 /// チャネルの役割
@@ -153,9 +153,7 @@ impl Channel {
         let deadline = std::time::Instant::now() + config.connect_timeout;
         loop {
             if Path::new(&path).exists() {
-                if std::fs::metadata(&path)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
+                if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
                     >= offsets.total_size as u64
                 {
                     break;
@@ -292,7 +290,9 @@ impl Channel {
     pub fn into_connection(self) -> crate::connection::ShmemConnection {
         let is_server = self.role == Role::Server;
         let name = self.name.clone();
-        let wait = SpinThenWait { spin_count: self.wait.spin_count };
+        let wait = SpinThenWait {
+            spin_count: self.wait.spin_count,
+        };
 
         // Drop を防ぐために分解
         let mmap = unsafe { std::ptr::read(&self.mmap) };

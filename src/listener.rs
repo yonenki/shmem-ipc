@@ -155,7 +155,7 @@ mod imp {
     use super::*;
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread::JoinHandle;
 
@@ -167,9 +167,9 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Named Pipe を1本作成し、client の接続を待つ
-    fn create_and_accept_pipe(pipe_path: &str) -> Result<File> {
-        use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE};
+    /// 未接続の Named Pipe instance を1本作成する
+    fn create_pipe_instance(pipe_path: &str) -> Result<File> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         use windows_sys::Win32::System::Pipes::*;
 
@@ -190,7 +190,15 @@ mod imp {
             return Err(std::io::Error::last_os_error().into());
         }
 
-        let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+        Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    /// 既存の Named Pipe instance が client に接続されるまで待つ
+    fn wait_for_pipe_client(pipe: File) -> Result<File> {
+        use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+        use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+
+        let ok = unsafe { ConnectNamedPipe(pipe.as_raw_handle() as _, std::ptr::null_mut()) };
         if ok == 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
@@ -198,7 +206,7 @@ mod imp {
             }
         }
 
-        Ok(unsafe { File::from_raw_handle(handle as _) })
+        Ok(pipe)
     }
 
     /// Named Pipe に client として接続
@@ -256,13 +264,14 @@ mod imp {
     }
 
     impl PendingAccept {
-        fn start(pipe_path: String) -> Self {
+        fn start(pipe_path: &str) -> Result<Self> {
+            let pipe = create_pipe_instance(pipe_path)?;
             let (tx, rx) = mpsc::channel();
             let handle = std::thread::spawn(move || {
-                let result = create_and_accept_pipe(&pipe_path);
+                let result = wait_for_pipe_client(pipe);
                 let _ = tx.send(result);
             });
-            Self { rx, handle }
+            Ok(Self { rx, handle })
         }
     }
 
@@ -312,20 +321,31 @@ mod imp {
             Ok(channel.into_connection())
         }
 
-        fn ensure_pending_accept(&mut self) {
+        fn ensure_pending_accept(&mut self) -> Result<()> {
             if self.pending_accept.is_none() {
-                self.pending_accept = Some(PendingAccept::start(self.pipe_path.clone()));
+                self.pending_accept = Some(PendingAccept::start(&self.pipe_path)?);
             }
+            Ok(())
+        }
+
+        fn prime_next_accept(&mut self) -> Result<()> {
+            debug_assert!(self.pending_accept.is_none());
+            // Keep one fresh server instance published at all times. Without this,
+            // clients racing the next accept can miss the pipe entirely on Windows.
+            self.pending_accept = Some(PendingAccept::start(&self.pipe_path)?);
+            Ok(())
         }
 
         fn wait_for_pipe(&mut self) -> Result<File> {
-            self.ensure_pending_accept();
+            self.ensure_pending_accept()?;
             let pending = self.pending_accept.take().unwrap();
 
             match pending.rx.recv() {
                 Ok(result) => {
                     let _ = pending.handle.join();
-                    result
+                    let pipe = result?;
+                    self.prime_next_accept()?;
+                    Ok(pipe)
                 }
                 Err(_) => {
                     let _ = pending.handle.join();
@@ -335,13 +355,15 @@ mod imp {
         }
 
         fn wait_for_pipe_timeout(&mut self, timeout: Duration) -> Result<File> {
-            self.ensure_pending_accept();
+            self.ensure_pending_accept()?;
             let pending = self.pending_accept.take().unwrap();
 
             match pending.rx.recv_timeout(timeout) {
                 Ok(result) => {
                     let _ = pending.handle.join();
-                    result
+                    let pipe = result?;
+                    self.prime_next_accept()?;
+                    Ok(pipe)
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Keep the same waiter alive; abandoning it would leave a stale

@@ -11,12 +11,12 @@
 //! Usage:
 //!   cargo run --release --example textil_bench
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use shmem_ipc::{connect, ChannelConfig, ShmemConnection, ShmemListener};
+use shmem_ipc::{ChannelConfig, ShmemConnection, ShmemListener, connect};
 
 // メッセージタイプ
 const MSG_REGISTER: u8 = 1;
@@ -47,8 +47,12 @@ fn encode_response(req_id: u32, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn msg_type(msg: &[u8]) -> u8 { msg[0] }
-fn msg_req_id(msg: &[u8]) -> u32 { u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]) }
+fn msg_type(msg: &[u8]) -> u8 {
+    msg[0]
+}
+fn msg_req_id(msg: &[u8]) -> u32 {
+    u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]])
+}
 
 // =========================================================================
 // Backend: echo server (split して recv → process → send)
@@ -68,7 +72,9 @@ fn backend_handler(conn: ShmemConnection) {
 
     let send_h = thread::spawn(move || {
         while let Ok(msg) = resp_rx.recv() {
-            if tx.send(&msg).is_err() { break; }
+            if tx.send(&msg).is_err() {
+                break;
+            }
         }
     });
 
@@ -110,7 +116,9 @@ fn run_backend(name: &str, shutdown: Arc<AtomicBool>, expected_clients: u32) {
         }
     }
 
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 // =========================================================================
@@ -143,7 +151,8 @@ fn run_frontend_bench(
     let mut conn = connect(name, ChannelConfig::default()).unwrap();
 
     // Register
-    conn.send(&encode_register(&format!("fe_{frontend_id}"))).unwrap();
+    conn.send(&encode_register(&format!("fe_{frontend_id}")))
+        .unwrap();
     let _ = conn.recv().unwrap();
 
     let (mut tx, mut rx) = conn.split();
@@ -189,12 +198,7 @@ fn run_frontend_bench(
 // Main
 // =========================================================================
 
-fn run_scenario(
-    scenario: &str,
-    num_frontends: u32,
-    msg_size: usize,
-    count: usize,
-) {
+fn run_scenario(scenario: &str, num_frontends: u32, msg_size: usize, count: usize) {
     let name = &format!("tbench_{}", scenario.replace(' ', "_"));
     ShmemListener::cleanup(name);
 
@@ -233,9 +237,7 @@ fn run_scenario(
     results.sort_by(|a, b| a.elapsed.cmp(&b.elapsed));
     let median = &results[results.len() / 2];
 
-    println!(
-        "  {scenario} ({num_frontends} frontends, {msg_size}B x {count}):"
-    );
+    println!("  {scenario} ({num_frontends} frontends, {msg_size}B x {count}):");
     println!(
         "    per-frontend: {:.2?}, {:.0} msg/s, {:.1} MB/s",
         median.elapsed,
@@ -244,9 +246,7 @@ fn run_scenario(
     );
     println!(
         "    aggregate:    {:.2?}, {:.0} msg/s, {:.1} MB/s",
-        max_elapsed,
-        aggregate_msg_rate,
-        aggregate_throughput
+        max_elapsed, aggregate_msg_rate, aggregate_throughput
     );
     println!();
 }
@@ -291,7 +291,8 @@ fn main() {
 
             let recv_h = thread::spawn(move || {
                 let mut count = 0;
-                for _ in 0..600 { // 6 sizes * 100 rounds
+                for _ in 0..600 {
+                    // 6 sizes * 100 rounds
                     let _ = rx.recv().unwrap();
                     count += 1;
                 }
@@ -316,9 +317,7 @@ fn main() {
     shutdown.store(true, Ordering::Relaxed);
     let _ = backend_h.join();
 
-    println!(
-        "    5 frontends, 6 sizes x 100 rounds = 3000 msgs each, {total} total recv"
-    );
+    println!("    5 frontends, 6 sizes x 100 rounds = 3000 msgs each, {total} total recv");
     println!("    elapsed: {mixed_elapsed:.2?}");
     println!();
 

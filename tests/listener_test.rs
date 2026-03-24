@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use shmem_ipc::{connect, ChannelConfig, ShmemListener};
+use shmem_ipc::{ChannelConfig, ShmemListener, connect};
 
 #[test]
 fn test_single_client() {
@@ -192,5 +192,46 @@ fn test_accept_timeout_then_multiple_clients_concurrent() {
 
     for h in handles {
         h.join().unwrap();
+    }
+}
+
+#[test]
+fn test_successful_accept_primes_next_instance_before_next_poll() {
+    let name = "test_ls_prime_next_accept";
+    ShmemListener::cleanup(name);
+
+    let mut listener = ShmemListener::bind(name, ChannelConfig::default()).unwrap();
+    let short_connect_config = ChannelConfig {
+        connect_timeout: Duration::from_millis(50),
+        ..ChannelConfig::default()
+    };
+
+    for i in 0u32..3 {
+        let config = if i == 0 {
+            ChannelConfig::default()
+        } else {
+            short_connect_config.clone()
+        };
+
+        let handle = thread::spawn(move || {
+            let mut conn = connect(name, config).unwrap();
+            conn.send(&i.to_le_bytes()).unwrap();
+            let reply = conn.recv().unwrap();
+            assert_eq!(reply, format!("ack_{i}").as_bytes());
+        });
+
+        if i > 0 {
+            // The next client must be able to connect before the server polls
+            // accept again. This is what the Windows textil bench relies on.
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let mut conn = listener.accept_timeout(Duration::from_secs(1)).unwrap();
+        let msg = conn.recv().unwrap();
+        let client_id = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
+        assert_eq!(client_id, i);
+        conn.send(format!("ack_{client_id}").as_bytes()).unwrap();
+
+        handle.join().unwrap();
     }
 }

@@ -9,8 +9,8 @@
 fn main() {
     use std::io::{BufWriter, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -57,8 +57,12 @@ fn main() {
         buf
     }
 
-    fn msg_type(msg: &[u8]) -> u8 { msg[0] }
-    fn msg_req_id(msg: &[u8]) -> u32 { u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]) }
+    fn msg_type(msg: &[u8]) -> u8 {
+        msg[0]
+    }
+    fn msg_req_id(msg: &[u8]) -> u32 {
+        u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]])
+    }
 
     // =========================================================================
     // Backend handler (per-connection thread)
@@ -123,7 +127,9 @@ fn main() {
             }
         }
 
-        for h in handles { let _ = h.join(); }
+        for h in handles {
+            let _ = h.join();
+        }
         let _ = std::fs::remove_file(path);
     }
 
@@ -215,8 +221,7 @@ fn main() {
         let total_msgs: usize = results.iter().map(|r| r.messages).sum();
         let total_bytes: u64 = results.iter().map(|r| r.total_bytes).sum();
         let max_elapsed = results.iter().map(|r| r.elapsed).max().unwrap();
-        let agg_throughput =
-            total_bytes as f64 / (1024.0 * 1024.0) / max_elapsed.as_secs_f64();
+        let agg_throughput = total_bytes as f64 / (1024.0 * 1024.0) / max_elapsed.as_secs_f64();
         let agg_msg_rate = total_msgs as f64 / max_elapsed.as_secs_f64();
 
         results.sort_by(|a, b| a.elapsed.cmp(&b.elapsed));
@@ -225,9 +230,7 @@ fn main() {
         let med_throughput =
             median.total_bytes as f64 / (1024.0 * 1024.0) / median.elapsed.as_secs_f64();
 
-        println!(
-            "  {scenario} ({num_frontends} frontends, {msg_size}B x {count}):"
-        );
+        println!("  {scenario} ({num_frontends} frontends, {msg_size}B x {count}):");
         println!(
             "    per-frontend: {:.2?}, {:.0} msg/s, {:.1} MB/s",
             median.elapsed, med_msg_rate, med_throughput

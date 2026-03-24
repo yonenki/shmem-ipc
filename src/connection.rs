@@ -105,19 +105,31 @@ impl ShmemConnection {
     }
 
     pub fn send(&mut self, payload: &[u8]) -> Result<()> {
-        self.sender.as_mut().expect("already split").send(payload, &self.wait, None)
+        self.sender
+            .as_mut()
+            .expect("already split")
+            .send(payload, &self.wait, None)
     }
 
     pub fn send_timeout(&mut self, payload: &[u8], timeout: Duration) -> Result<()> {
-        self.sender.as_mut().expect("already split").send(payload, &self.wait, Some(timeout))
+        self.sender
+            .as_mut()
+            .expect("already split")
+            .send(payload, &self.wait, Some(timeout))
     }
 
     pub fn recv(&mut self) -> Result<Vec<u8>> {
-        self.receiver.as_mut().expect("already split").recv(&self.wait, None)
+        self.receiver
+            .as_mut()
+            .expect("already split")
+            .recv(&self.wait, None)
     }
 
     pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>> {
-        self.receiver.as_mut().expect("already split").recv(&self.wait, Some(timeout))
+        self.receiver
+            .as_mut()
+            .expect("already split")
+            .recv(&self.wait, Some(timeout))
     }
 
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
@@ -137,7 +149,8 @@ impl Drop for ShmemConnection {
 
         let base = self.mmap.as_ptr();
         let gh = unsafe { GlobalHeader::from_ptr(base) };
-        gh.state.store(ChannelState::Closed as u32, Ordering::Release);
+        gh.state
+            .store(ChannelState::Closed as u32, Ordering::Release);
 
         let ring_data_size = gh.ring_data_size as usize;
         let offsets = RingOffsets::new(ring_data_size);

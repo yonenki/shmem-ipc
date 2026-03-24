@@ -11,8 +11,8 @@
 //!   cargo run --release --example bench -- burst
 //!   cargo run --release --example bench -- stream
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,9 @@ const SPIN_COUNT: u32 = 256;
 
 fn make_config() -> ChannelConfig {
     ChannelConfig {
-        wait_strategy: SpinThenWait { spin_count: SPIN_COUNT },
+        wait_strategy: SpinThenWait {
+            spin_count: SPIN_COUNT,
+        },
         ..Default::default()
     }
 }
@@ -72,11 +74,16 @@ fn bench_pingpong(name: &str, msg_size: usize, count: usize, warmup: usize) {
         let total = total_start.elapsed();
         latencies.sort();
         let p50 = latencies[count / 2];
-        let throughput = (msg_size as u64 * count as u64 * 2) as f64
-            / (1024.0 * 1024.0)
-            / total.as_secs_f64();
+        let throughput =
+            (msg_size as u64 * count as u64 * 2) as f64 / (1024.0 * 1024.0) / total.as_secs_f64();
 
-        println!("  Round {}/{}: p50={:.2?}, {:.1} MB/s", r + 1, ROUNDS, p50, throughput);
+        println!(
+            "  Round {}/{}: p50={:.2?}, {:.1} MB/s",
+            r + 1,
+            ROUNDS,
+            p50,
+            throughput
+        );
         results.push((p50, throughput));
     }
 
@@ -126,7 +133,13 @@ fn bench_burst(name: &str, msg_size: usize, burst_size: usize, bursts: usize) {
         let total_bytes = msg_size as u64 * bursts as u64 * burst_size as u64;
         let throughput = total_bytes as f64 / (1024.0 * 1024.0) / total.as_secs_f64();
 
-        println!("  Round {}/{}: {:.2?}, {:.1} MB/s", r + 1, ROUNDS, total, throughput);
+        println!(
+            "  Round {}/{}: {:.2?}, {:.1} MB/s",
+            r + 1,
+            ROUNDS,
+            total,
+            throughput
+        );
         results.push((total, throughput));
     }
 
@@ -191,7 +204,13 @@ fn bench_stream(name: &str, msg_size: usize, count: usize) {
         let total_bytes = msg_size as u64 * count as u64;
         let throughput = total_bytes as f64 / (1024.0 * 1024.0) / total.as_secs_f64();
 
-        println!("  Round {}/{}: {:.2?}, {:.1} MB/s (send)", r + 1, ROUNDS, total, throughput);
+        println!(
+            "  Round {}/{}: {:.2?}, {:.1} MB/s (send)",
+            r + 1,
+            ROUNDS,
+            total,
+            throughput
+        );
         results.push((total, throughput));
     }
 
@@ -215,7 +234,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("all");
 
-    let sizes: &[(& str, usize)] = &[
+    let sizes: &[(&str, usize)] = &[
         ("64B", 64),
         ("256B", 256),
         ("4KB", 4_096),

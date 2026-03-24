@@ -113,7 +113,10 @@ fn test_try_recv() {
             if let Some(msg) = client.try_recv().unwrap() {
                 break msg;
             }
-            assert!(Instant::now() < deadline, "try_recv timed out waiting for message");
+            assert!(
+                Instant::now() < deadline,
+                "try_recv timed out waiting for message"
+            );
             thread::yield_now();
         };
         assert_eq!(msg, b"ping");

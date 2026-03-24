@@ -13,12 +13,12 @@
 //!   cargo run --release --example textil_pattern
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use shmem_ipc::{connect, ChannelConfig, ShmemConnection, ShmemListener};
+use shmem_ipc::{ChannelConfig, ShmemConnection, ShmemListener, connect};
 
 // =========================================================================
 // メッセージ定義 (textil の ClientMessage/ServerMessage を簡略化)
@@ -108,11 +108,7 @@ fn msg_request_id(msg: &[u8]) -> u32 {
 // Backend
 // =========================================================================
 
-fn run_backend(
-    name: &str,
-    shutdown: Arc<AtomicBool>,
-    connected_count: Arc<AtomicU32>,
-) {
+fn run_backend(name: &str, shutdown: Arc<AtomicBool>, connected_count: Arc<AtomicU32>) {
     let mut listener = ShmemListener::bind(name, ChannelConfig::default()).unwrap();
     println!("[backend] listening on '{name}'");
 
@@ -317,10 +313,7 @@ fn run_frontend(name: &str, frontend_id: u32, results: Arc<std::sync::Mutex<Vec<
             got_responses >= 50,
             "{instance_id_clone}: expected >=50 responses, got {got_responses}"
         );
-        assert!(
-            stream_complete,
-            "{instance_id_clone}: stream not completed"
-        );
+        assert!(stream_complete, "{instance_id_clone}: stream not completed");
         for (req_id, data) in &responses {
             // Echo response の検証
             let expected = format!("request_{req_id}");
