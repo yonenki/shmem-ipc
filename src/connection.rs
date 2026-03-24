@@ -7,11 +7,46 @@ use crate::error::Result;
 use crate::ring::{RingReceiver, RingSender};
 use crate::wait::SpinThenWait;
 
-/// 共有メモリ接続の送信半分
+struct ConnectionDropGuard {
+    mmap: MmapMut,
+    name: String,
+    is_server: bool,
+}
+
+impl Drop for ConnectionDropGuard {
+    fn drop(&mut self) {
+        use crate::header::{ChannelState, GlobalHeader, RingHeader, RingOffsets};
+        use crate::platform;
+        use std::sync::atomic::Ordering;
+
+        let base = self.mmap.as_ptr();
+        let gh = unsafe { GlobalHeader::from_ptr(base) };
+        gh.state
+            .store(ChannelState::Closed as u32, Ordering::Release);
+
+        let ring_data_size = gh.ring_data_size as usize;
+        let offsets = RingOffsets::new(ring_data_size);
+        let base = base as *mut u8;
+        for offset in [offsets.ring_a_header, offsets.ring_b_header] {
+            let rh = unsafe { &*(base.add(offset) as *const RingHeader) };
+            rh.writer.notify.fetch_add(1, Ordering::Release);
+            platform::futex_wake(&rh.writer.notify);
+            rh.reader.notify.fetch_add(1, Ordering::Release);
+            platform::futex_wake(&rh.reader.notify);
+        }
+
+        if self.is_server {
+            let path = platform::shm_path(&self.name);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Send side of a shared-memory connection.
 pub struct SendHalf {
     sender: RingSender,
     wait: SpinThenWait,
-    _mmap: Arc<MmapMut>,
+    _shared: Arc<ConnectionDropGuard>,
 }
 
 unsafe impl Send for SendHalf {}
@@ -26,11 +61,11 @@ impl SendHalf {
     }
 }
 
-/// 共有メモリ接続の受信半分
+/// Receive side of a shared-memory connection.
 pub struct RecvHalf {
     receiver: RingReceiver,
     wait: SpinThenWait,
-    _mmap: Arc<MmapMut>,
+    _shared: Arc<ConnectionDropGuard>,
 }
 
 unsafe impl Send for RecvHalf {}
@@ -53,14 +88,12 @@ impl RecvHalf {
     }
 }
 
-/// split 可能な共有メモリ接続
+/// Shared-memory connection that can be split into send and receive halves.
 pub struct ShmemConnection {
-    mmap: Arc<MmapMut>,
+    shared: Arc<ConnectionDropGuard>,
     sender: Option<RingSender>,
     receiver: Option<RingReceiver>,
     wait: SpinThenWait,
-    name: String,
-    is_server: bool,
 }
 
 impl ShmemConnection {
@@ -73,34 +106,35 @@ impl ShmemConnection {
         is_server: bool,
     ) -> Self {
         Self {
-            mmap: Arc::new(mmap),
+            shared: Arc::new(ConnectionDropGuard {
+                mmap,
+                name,
+                is_server,
+            }),
             sender: Some(sender),
             receiver: Some(receiver),
             wait,
-            name,
-            is_server,
         }
     }
 
-    /// 送信と受信を分離する
+    /// Split the connection into independent send and receive halves.
     pub fn split(mut self) -> (SendHalf, RecvHalf) {
         let sender = self.sender.take().expect("already split");
         let receiver = self.receiver.take().expect("already split");
-        let mmap = self.mmap.clone();
+        let shared = self.shared.clone();
 
         let send_half = SendHalf {
             sender,
             wait: self.wait.clone(),
-            _mmap: mmap.clone(),
+            _shared: shared.clone(),
         };
 
         let recv_half = RecvHalf {
             receiver,
             wait: self.wait.clone(),
-            _mmap: mmap,
+            _shared: shared,
         };
 
-        std::mem::forget(self);
         (send_half, recv_half)
     }
 
@@ -137,35 +171,6 @@ impl ShmemConnection {
     }
 
     pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl Drop for ShmemConnection {
-    fn drop(&mut self) {
-        use crate::header::{ChannelState, GlobalHeader, RingHeader, RingOffsets};
-        use crate::platform;
-        use std::sync::atomic::Ordering;
-
-        let base = self.mmap.as_ptr();
-        let gh = unsafe { GlobalHeader::from_ptr(base) };
-        gh.state
-            .store(ChannelState::Closed as u32, Ordering::Release);
-
-        let ring_data_size = gh.ring_data_size as usize;
-        let offsets = RingOffsets::new(ring_data_size);
-        let base = base as *mut u8;
-        for offset in [offsets.ring_a_header, offsets.ring_b_header] {
-            let rh = unsafe { &*(base.add(offset) as *const RingHeader) };
-            rh.writer.notify.fetch_add(1, Ordering::Release);
-            platform::futex_wake(&rh.writer.notify);
-            rh.reader.notify.fetch_add(1, Ordering::Release);
-            platform::futex_wake(&rh.reader.notify);
-        }
-
-        if self.is_server {
-            let path = platform::shm_path(&self.name);
-            let _ = std::fs::remove_file(path);
-        }
+        &self.shared.name
     }
 }

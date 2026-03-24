@@ -134,6 +134,37 @@ fn test_split_connection() {
     handle.join().unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn test_split_connection_reuses_listener_name_across_generations() {
+    let name = "test_ls_split_reuse";
+    ShmemListener::cleanup(name);
+
+    for generation in 0u32..3 {
+        let mut listener = ShmemListener::bind(name, ChannelConfig::default()).unwrap();
+
+        let handle = thread::spawn(move || {
+            let conn = connect(name, ChannelConfig::default()).unwrap();
+            let (mut tx, mut rx) = conn.split();
+
+            tx.send(&generation.to_le_bytes()).unwrap();
+            let reply = rx.recv().unwrap();
+            assert_eq!(reply, format!("ack_{generation}").as_bytes());
+        });
+
+        let conn = listener.accept_timeout(Duration::from_secs(1)).unwrap();
+        let (mut tx, mut rx) = conn.split();
+
+        let msg = rx.recv().unwrap();
+        let got = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
+        assert_eq!(got, generation);
+        tx.send(format!("ack_{generation}").as_bytes()).unwrap();
+
+        handle.join().unwrap();
+        drop(listener);
+    }
+}
+
 #[test]
 fn test_accept_timeout() {
     let name = "test_ls_timeout";
