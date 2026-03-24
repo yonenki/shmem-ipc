@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, SetEvent,
-    WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
+    CreateWaitableTimerExW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, SetEvent,
+    SetWaitableTimerEx, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 const INFINITE: u32 = 0xFFFF_FFFF;
@@ -33,7 +34,7 @@ impl WaitSlot {
 
 #[derive(Clone)]
 pub struct WaitHandle {
-    inner: Arc<NamedEvent>,
+    inner: Arc<WaitObjects>,
 }
 
 #[derive(Clone)]
@@ -44,18 +45,24 @@ pub struct ChannelWaitSet {
     pub ring_b_reader: WaitHandle,
 }
 
-struct NamedEvent {
-    handle: HANDLE,
+struct WaitObjects {
+    event: HANDLE,
+    timeout_timer: HANDLE,
 }
 
-unsafe impl Send for NamedEvent {}
-unsafe impl Sync for NamedEvent {}
+unsafe impl Send for WaitObjects {}
+unsafe impl Sync for WaitObjects {}
 
-impl Drop for NamedEvent {
+impl Drop for WaitObjects {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        if !self.event.is_null() {
             unsafe {
-                CloseHandle(self.handle);
+                CloseHandle(self.event);
+            }
+        }
+        if !self.timeout_timer.is_null() {
+            unsafe {
+                CloseHandle(self.timeout_timer);
             }
         }
     }
@@ -64,13 +71,31 @@ impl Drop for NamedEvent {
 impl WaitHandle {
     fn open(channel_name: &str, wait_key: u64, slot: WaitSlot) -> io::Result<Self> {
         let name = event_name(channel_name, wait_key, slot);
-        let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
-        if handle.is_null() {
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let timeout_timer = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        if timeout_timer.is_null() {
+            unsafe {
+                CloseHandle(event);
+            }
             return Err(io::Error::last_os_error());
         }
 
         Ok(Self {
-            inner: Arc::new(NamedEvent { handle }),
+            inner: Arc::new(WaitObjects {
+                event,
+                timeout_timer,
+            }),
         })
     }
 }
@@ -92,33 +117,88 @@ pub fn wait_on_handle(
     _expected: u32,
     timeout: Option<Duration>,
 ) {
-    let result = unsafe { WaitForSingleObject(handle.inner.handle, timeout_to_millis(timeout)) };
-    if result == WAIT_FAILED {
-        let err = io::Error::last_os_error();
-        panic!("shmem-ipc: WaitForSingleObject failed: {err}");
+    match timeout {
+        None => wait_for_event(handle.inner.event, INFINITE),
+        Some(timeout) if timeout.is_zero() => wait_for_event(handle.inner.event, 0),
+        Some(timeout) => wait_for_event_or_timeout(handle, timeout),
     }
 }
 
 pub fn wake_handle(handle: &WaitHandle, _word: &AtomicU32) {
-    let ok = unsafe { SetEvent(handle.inner.handle) };
+    let ok = unsafe { SetEvent(handle.inner.event) };
     if ok == 0 {
         let err = io::Error::last_os_error();
         panic!("shmem-ipc: SetEvent failed: {err}");
     }
 }
 
-fn timeout_to_millis(timeout: Option<Duration>) -> u32 {
-    match timeout {
-        None => INFINITE,
-        Some(timeout) => {
-            let millis = timeout.as_millis();
-            if millis == 0 {
-                if timeout.is_zero() { 0 } else { 1 }
-            } else {
-                millis.min((u32::MAX - 1) as u128) as u32
-            }
+fn wait_for_event(event: HANDLE, timeout_ms: u32) {
+    let result = unsafe { WaitForSingleObject(event, timeout_ms) };
+    match result {
+        WAIT_OBJECT_0 | WAIT_TIMEOUT => {}
+        WAIT_FAILED => {
+            let err = io::Error::last_os_error();
+            panic!("shmem-ipc: WaitForSingleObject failed: {err}");
+        }
+        unexpected => {
+            panic!("shmem-ipc: WaitForSingleObject returned unexpected status {unexpected}");
         }
     }
+}
+
+fn wait_for_event_or_timeout(handle: &WaitHandle, timeout: Duration) {
+    arm_timeout_timer(handle.inner.timeout_timer, timeout);
+
+    let handles = [handle.inner.event, handle.inner.timeout_timer];
+    let result =
+        unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+    match result {
+        WAIT_OBJECT_0 => disarm_timeout_timer(handle.inner.timeout_timer),
+        value if value == WAIT_OBJECT_0 + 1 => {}
+        WAIT_FAILED => {
+            let err = io::Error::last_os_error();
+            panic!("shmem-ipc: WaitForMultipleObjects failed: {err}");
+        }
+        unexpected => {
+            panic!("shmem-ipc: WaitForMultipleObjects returned unexpected status {unexpected}");
+        }
+    }
+}
+
+fn arm_timeout_timer(timer: HANDLE, timeout: Duration) {
+    let due_time = timeout_to_due_time(timeout);
+    let ok = unsafe {
+        SetWaitableTimerEx(
+            timer,
+            &due_time,
+            0,
+            None,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        panic!("shmem-ipc: SetWaitableTimerEx failed: {err}");
+    }
+}
+
+fn disarm_timeout_timer(timer: HANDLE) {
+    let ok = unsafe { CancelWaitableTimer(timer) };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        panic!("shmem-ipc: CancelWaitableTimer failed: {err}");
+    }
+
+    // Synchronization timers reset only when their wait is consumed.
+    // Drain any already-signaled timer so the next wait cannot observe a stale timeout.
+    wait_for_event(timer, 0);
+}
+
+fn timeout_to_due_time(timeout: Duration) -> i64 {
+    let ticks_100ns = timeout.as_nanos().div_ceil(100).min(i64::MAX as u128) as i64;
+    -ticks_100ns
 }
 
 fn event_name(channel_name: &str, wait_key: u64, slot: WaitSlot) -> Vec<u16> {
