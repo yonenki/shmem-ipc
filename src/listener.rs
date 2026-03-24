@@ -153,28 +153,162 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::windows::io::FromRawHandle;
+
+    fn pipe_name(name: &str) -> String {
+        format!(r"\\.\pipe\shmem_ipc_{name}")
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Named Pipe を1本作成し、client の接続を待つ
+    fn create_and_accept_pipe(pipe_path: &str) -> Result<File> {
+        use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, ERROR_PIPE_CONNECTED};
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::*;
+
+        let wide_name = wide(pipe_path);
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wide_name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                return Err(err.into());
+            }
+        }
+
+        Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    /// Named Pipe に client として接続
+    fn connect_pipe(pipe_path: &str, timeout: Duration) -> Result<File> {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
+
+        let wide_name = wide(pipe_path);
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let handle = unsafe {
+                CreateFileW(
+                    wide_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                return Ok(unsafe { File::from_raw_handle(handle as _) });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::TimedOut);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn send_conn_name(pipe: &mut File, name: &str) -> Result<()> {
+        let bytes = name.as_bytes();
+        let len = bytes.len() as u16;
+        pipe.write_all(&len.to_le_bytes())?;
+        pipe.write_all(bytes)?;
+        pipe.flush()?;
+        Ok(())
+    }
+
+    fn recv_conn_name(pipe: &mut File) -> Result<String> {
+        let mut len_buf = [0u8; 2];
+        pipe.read_exact(&mut len_buf)?;
+        let len = u16::from_le_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        pipe.read_exact(&mut buf)?;
+        String::from_utf8(buf)
+            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+    }
 
     pub struct Listener {
         name: String,
         config: ChannelConfig,
         counter: u64,
+        pipe_path: String,
     }
 
     impl Listener {
         pub fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
-            // TODO: CreateNamedPipeW で listen
-            todo!("Windows listener not yet implemented")
+            let pipe_path = pipe_name(name);
+            Ok(Self {
+                name: name.to_string(),
+                config,
+                counter: 0,
+                pipe_path,
+            })
         }
 
         pub fn accept(&mut self) -> Result<ShmemConnection> {
-            todo!("Windows accept not yet implemented")
+            let mut pipe = create_and_accept_pipe(&self.pipe_path)?;
+            self.handshake(&mut pipe)
         }
 
-        pub fn accept_timeout(&mut self, _timeout: Duration) -> Result<ShmemConnection> {
-            todo!("Windows accept_timeout not yet implemented")
+        pub fn accept_timeout(&mut self, timeout: Duration) -> Result<ShmemConnection> {
+            // Windows Named Pipe の ConnectNamedPipe はブロッキング。
+            // タイムアウトは別スレッドで実現。
+            let pipe_path = self.pipe_path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let result = create_and_accept_pipe(&pipe_path);
+                let _ = tx.send(result);
+            });
+
+            match rx.recv_timeout(timeout) {
+                Ok(Ok(mut pipe)) => {
+                    let _ = handle.join();
+                    self.handshake(&mut pipe)
+                }
+                Ok(Err(e)) => {
+                    let _ = handle.join();
+                    Err(e)
+                }
+                Err(_) => {
+                    // タイムアウト — スレッドは放置 (pipe は drop される)
+                    Err(Error::TimedOut)
+                }
+            }
         }
 
-        pub fn cleanup(_name: &str) {}
+        fn handshake(&mut self, pipe: &mut File) -> Result<ShmemConnection> {
+            let conn_name = format!("{}.conn.{}", self.name, self.counter);
+            self.counter += 1;
+
+            let channel = Channel::create_with_config(&conn_name, self.config.clone())?;
+            send_conn_name(pipe, &conn_name)?;
+            Ok(channel.into_connection())
+        }
+
+        pub fn cleanup(_name: &str) {
+            // Windows Named Pipe はハンドルを閉じれば自動クリーンアップ
+        }
     }
 
     impl Drop for Listener {
@@ -182,7 +316,11 @@ mod imp {
     }
 
     pub fn connect_to(name: &str, config: ChannelConfig) -> Result<ShmemConnection> {
-        todo!("Windows connect not yet implemented")
+        let pipe_path = pipe_name(name);
+        let mut pipe = connect_pipe(&pipe_path, config.connect_timeout)?;
+        let conn_name = recv_conn_name(&mut pipe)?;
+        let channel = Channel::open_with_config(&conn_name, config)?;
+        Ok(channel.into_connection())
     }
 }
 
