@@ -156,6 +156,8 @@ mod imp {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::windows::io::FromRawHandle;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread::JoinHandle;
 
     fn pipe_name(name: &str) -> String {
         format!(r"\\.\pipe\shmem_ipc_{name}")
@@ -167,7 +169,7 @@ mod imp {
 
     /// Named Pipe を1本作成し、client の接続を待つ
     fn create_and_accept_pipe(pipe_path: &str) -> Result<File> {
-        use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, ERROR_PIPE_CONNECTED};
+        use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         use windows_sys::Win32::System::Pipes::*;
 
@@ -248,11 +250,35 @@ mod imp {
             .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
 
+    struct PendingAccept {
+        rx: Receiver<Result<File>>,
+        handle: JoinHandle<()>,
+    }
+
+    impl PendingAccept {
+        fn start(pipe_path: String) -> Self {
+            let (tx, rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let result = create_and_accept_pipe(&pipe_path);
+                let _ = tx.send(result);
+            });
+            Self { rx, handle }
+        }
+    }
+
+    fn accept_thread_disconnected() -> Error {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "named pipe accept thread disconnected",
+        ))
+    }
+
     pub struct Listener {
         name: String,
         config: ChannelConfig,
         counter: u64,
         pipe_path: String,
+        pending_accept: Option<PendingAccept>,
     }
 
     impl Listener {
@@ -263,38 +289,18 @@ mod imp {
                 config,
                 counter: 0,
                 pipe_path,
+                pending_accept: None,
             })
         }
 
         pub fn accept(&mut self) -> Result<ShmemConnection> {
-            let mut pipe = create_and_accept_pipe(&self.pipe_path)?;
+            let mut pipe = self.wait_for_pipe()?;
             self.handshake(&mut pipe)
         }
 
         pub fn accept_timeout(&mut self, timeout: Duration) -> Result<ShmemConnection> {
-            // Windows Named Pipe の ConnectNamedPipe はブロッキング。
-            // タイムアウトは別スレッドで実現。
-            let pipe_path = self.pipe_path.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let result = create_and_accept_pipe(&pipe_path);
-                let _ = tx.send(result);
-            });
-
-            match rx.recv_timeout(timeout) {
-                Ok(Ok(mut pipe)) => {
-                    let _ = handle.join();
-                    self.handshake(&mut pipe)
-                }
-                Ok(Err(e)) => {
-                    let _ = handle.join();
-                    Err(e)
-                }
-                Err(_) => {
-                    // タイムアウト — スレッドは放置 (pipe は drop される)
-                    Err(Error::TimedOut)
-                }
-            }
+            let mut pipe = self.wait_for_pipe_timeout(timeout)?;
+            self.handshake(&mut pipe)
         }
 
         fn handshake(&mut self, pipe: &mut File) -> Result<ShmemConnection> {
@@ -306,13 +312,76 @@ mod imp {
             Ok(channel.into_connection())
         }
 
+        fn ensure_pending_accept(&mut self) {
+            if self.pending_accept.is_none() {
+                self.pending_accept = Some(PendingAccept::start(self.pipe_path.clone()));
+            }
+        }
+
+        fn wait_for_pipe(&mut self) -> Result<File> {
+            self.ensure_pending_accept();
+            let pending = self.pending_accept.take().unwrap();
+
+            match pending.rx.recv() {
+                Ok(result) => {
+                    let _ = pending.handle.join();
+                    result
+                }
+                Err(_) => {
+                    let _ = pending.handle.join();
+                    Err(accept_thread_disconnected())
+                }
+            }
+        }
+
+        fn wait_for_pipe_timeout(&mut self, timeout: Duration) -> Result<File> {
+            self.ensure_pending_accept();
+            let pending = self.pending_accept.take().unwrap();
+
+            match pending.rx.recv_timeout(timeout) {
+                Ok(result) => {
+                    let _ = pending.handle.join();
+                    result
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Keep the same waiter alive; abandoning it would leave a stale
+                    // server instance that clients can connect to without a handshake.
+                    self.pending_accept = Some(pending);
+                    Err(Error::TimedOut)
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = pending.handle.join();
+                    Err(accept_thread_disconnected())
+                }
+            }
+        }
+
+        fn cancel_pending_accept(&mut self) {
+            let Some(pending) = self.pending_accept.take() else {
+                return;
+            };
+
+            if !pending.handle.is_finished() {
+                // Best-effort: connect to our own pending instance so ConnectNamedPipe
+                // returns and the waiter thread can exit before we drop the listener.
+                let _ = connect_pipe(&self.pipe_path, Duration::from_millis(50));
+                let _ = pending.rx.recv_timeout(Duration::from_millis(50));
+            }
+
+            if pending.handle.is_finished() {
+                let _ = pending.handle.join();
+            }
+        }
+
         pub fn cleanup(_name: &str) {
             // Windows Named Pipe はハンドルを閉じれば自動クリーンアップ
         }
     }
 
     impl Drop for Listener {
-        fn drop(&mut self) {}
+        fn drop(&mut self) {
+            self.cancel_pending_accept();
+        }
     }
 
     pub fn connect_to(name: &str, config: ChannelConfig) -> Result<ShmemConnection> {

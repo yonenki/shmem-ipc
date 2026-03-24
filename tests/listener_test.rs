@@ -149,3 +149,48 @@ fn test_accept_timeout() {
     assert!(elapsed >= Duration::from_millis(90));
     assert!(elapsed < Duration::from_millis(500));
 }
+
+#[test]
+fn test_accept_timeout_then_multiple_clients_concurrent() {
+    let name = "test_ls_timeout_then_multi";
+    ShmemListener::cleanup(name);
+
+    let mut listener = ShmemListener::bind(name, ChannelConfig::default()).unwrap();
+
+    let result = listener.accept_timeout(Duration::from_millis(50));
+    assert!(matches!(result, Err(shmem_ipc::Error::TimedOut)));
+
+    let mut handles = Vec::new();
+    for i in 0u32..5 {
+        handles.push(thread::spawn(move || {
+            let mut conn = connect(name, ChannelConfig::default()).unwrap();
+            conn.send(&i.to_le_bytes()).unwrap();
+            let reply = conn.recv().unwrap();
+            assert_eq!(reply, format!("ack_{i}").as_bytes());
+        }));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut accepted = 0usize;
+    while accepted < 5 && std::time::Instant::now() < deadline {
+        match listener.accept_timeout(Duration::from_millis(200)) {
+            Ok(mut conn) => {
+                let msg = conn.recv().unwrap();
+                let client_id = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
+                conn.send(format!("ack_{client_id}").as_bytes()).unwrap();
+                accepted += 1;
+            }
+            Err(shmem_ipc::Error::TimedOut) => {}
+            Err(e) => panic!("unexpected accept error: {e:?}"),
+        }
+    }
+
+    assert_eq!(
+        accepted, 5,
+        "listener did not accept all concurrent clients"
+    );
+
+    for h in handles {
+        h.join().unwrap();
+    }
+}
