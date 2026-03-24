@@ -9,6 +9,7 @@ use crate::wait::SpinThenWait;
 
 struct ConnectionDropGuard {
     mmap: MmapMut,
+    wait_set: crate::platform::ChannelWaitSet,
     name: String,
     is_server: bool,
 }
@@ -27,13 +28,17 @@ impl Drop for ConnectionDropGuard {
         let ring_data_size = gh.ring_data_size as usize;
         let offsets = RingOffsets::new(ring_data_size);
         let base = base as *mut u8;
-        for offset in [offsets.ring_a_header, offsets.ring_b_header] {
-            let rh = unsafe { &*(base.add(offset) as *const RingHeader) };
-            rh.writer.notify.fetch_add(1, Ordering::Release);
-            platform::futex_wake(&rh.writer.notify);
-            rh.reader.notify.fetch_add(1, Ordering::Release);
-            platform::futex_wake(&rh.reader.notify);
-        }
+        let ring_a = unsafe { &*(base.add(offsets.ring_a_header) as *const RingHeader) };
+        ring_a.writer.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_a_writer, &ring_a.writer.notify);
+        ring_a.reader.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_a_reader, &ring_a.reader.notify);
+
+        let ring_b = unsafe { &*(base.add(offsets.ring_b_header) as *const RingHeader) };
+        ring_b.writer.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_b_writer, &ring_b.writer.notify);
+        ring_b.reader.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_b_reader, &ring_b.reader.notify);
 
         if self.is_server {
             let path = platform::shm_path(&self.name);
@@ -101,6 +106,7 @@ impl ShmemConnection {
         mmap: MmapMut,
         sender: RingSender,
         receiver: RingReceiver,
+        wait_set: crate::platform::ChannelWaitSet,
         wait: SpinThenWait,
         name: String,
         is_server: bool,
@@ -108,6 +114,7 @@ impl ShmemConnection {
         Self {
             shared: Arc::new(ConnectionDropGuard {
                 mmap,
+                wait_set,
                 name,
                 is_server,
             }),

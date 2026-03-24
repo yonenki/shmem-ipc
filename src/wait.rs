@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -11,6 +11,7 @@ pub trait WaitStrategy: Send + Sync {
     /// parked: 自分が futex に入っていることを相手に伝えるフラグ
     fn wait_until<T, F>(
         &self,
+        handle: &platform::WaitHandle,
         notify: &AtomicU32,
         parked: &AtomicU32,
         timeout: Option<Duration>,
@@ -20,16 +21,21 @@ pub trait WaitStrategy: Send + Sync {
         F: Fn() -> Result<Option<T>>;
 
     /// 相手が parked していれば futex_wake を呼ぶ。していなければ何もしない。
-    fn wake_if_parked(&self, notify: &AtomicU32, parked: &AtomicU32) {
+    fn wake_if_parked(
+        &self,
+        handle: &platform::WaitHandle,
+        notify: &AtomicU32,
+        parked: &AtomicU32,
+    ) {
         // notify は既に bump 済みの前提で呼ばれる
         if parked.load(Ordering::Acquire) != 0 {
-            platform::futex_wake(notify);
+            platform::wake_handle(handle, notify);
         }
     }
 
     /// 強制 wake (close 時)。parked に関わらず呼ぶ。
-    fn wake_force(&self, notify: &AtomicU32) {
-        platform::futex_wake(notify);
+    fn wake_force(&self, handle: &platform::WaitHandle, notify: &AtomicU32) {
+        platform::wake_handle(handle, notify);
     }
 }
 
@@ -48,6 +54,7 @@ impl Default for SpinThenWait {
 impl WaitStrategy for SpinThenWait {
     fn wait_until<T, F>(
         &self,
+        handle: &platform::WaitHandle,
         notify: &AtomicU32,
         parked: &AtomicU32,
         timeout: Option<Duration>,
@@ -88,6 +95,15 @@ impl WaitStrategy for SpinThenWait {
             // parked = 1: 「自分は寝る」と宣言
             parked.store(1, Ordering::Release);
 
+            // StoreLoad バリア: parked の store がグローバルに可視になってから
+            // condition の load を実行することを保証する。
+            // これがないと x86-64 の store buffer bypass により、waker 側の
+            // parked.load() が 0 を読み、同時にこちらの condition() も古い値を読む
+            // Dekker パターンの missed wakeup が発生し得る。
+            // Linux では futex の atomic check-and-sleep がこの役割を担うが、
+            // Windows の WaitForSingleObject にはその機構がないため必須。
+            fence(Ordering::SeqCst);
+
             // 宣言後にもう一度チェック (parked セット前に相手が publish した場合を拾う)
             match condition()? {
                 Some(val) => {
@@ -97,7 +113,7 @@ impl WaitStrategy for SpinThenWait {
                 None => {}
             }
 
-            platform::futex_wait(notify, snapshot, remaining);
+            platform::wait_on_handle(handle, notify, snapshot, remaining);
             parked.store(0, Ordering::Relaxed);
         }
     }
@@ -109,6 +125,7 @@ pub struct SpinOnly;
 impl WaitStrategy for SpinOnly {
     fn wait_until<T, F>(
         &self,
+        _handle: &platform::WaitHandle,
         _notify: &AtomicU32,
         _parked: &AtomicU32,
         timeout: Option<Duration>,

@@ -167,8 +167,6 @@ fn handle_client(conn: ShmemConnection, shutdown: Arc<AtomicBool>) {
     let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     // 3. 送信スレッド: resp_rx からレスポンスを読んで tx に書く
-    let instance_id_clone = instance_id.clone();
-    let shutdown_clone = shutdown.clone();
     let send_handle = thread::spawn(move || {
         while let Ok(msg) = resp_rx.recv() {
             if tx.send(&msg).is_err() {
@@ -260,7 +258,6 @@ fn run_frontend(name: &str, frontend_id: u32, results: Arc<std::sync::Mutex<Vec<
         let mut responses: HashMap<u32, Vec<u8>> = HashMap::new();
         let mut stream_chunks: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
         let mut events: Vec<Vec<u8>> = Vec::new();
-        let mut expected_responses = 0u32;
         let mut got_responses = 0u32;
         let mut stream_complete = false;
 

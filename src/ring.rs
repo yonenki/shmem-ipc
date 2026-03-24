@@ -18,6 +18,8 @@ pub struct RingSender {
     base: *mut u8,
     ring_header: *const RingHeader,
     global_header: *const GlobalHeader,
+    writer_wait: platform::WaitHandle,
+    reader_wait: platform::WaitHandle,
     data_offset: usize,
     ring_data_size: usize,
     ring_mask: usize,
@@ -36,6 +38,8 @@ impl RingSender {
         base: *mut u8,
         ring_header: *const RingHeader,
         global_header: *const GlobalHeader,
+        writer_wait: platform::WaitHandle,
+        reader_wait: platform::WaitHandle,
         data_offset: usize,
         ring_data_size: usize,
     ) -> Self {
@@ -44,6 +48,8 @@ impl RingSender {
             base,
             ring_header,
             global_header,
+            writer_wait,
+            reader_wait,
             data_offset,
             ring_data_size,
             ring_mask: ring_data_size - 1,
@@ -84,19 +90,25 @@ impl RingSender {
             let reader_parked = unsafe { &(*ring_header).reader.parked };
             let state = unsafe { &(*global_header).state };
 
-            let new_rc = wait.wait_until(reader_notify, reader_parked, timeout, || {
-                let rc = read_cursor.load(Ordering::Acquire);
-                let free = ring_data_size as u64 - (wc - rc);
-                if free >= msg_len as u64 {
-                    Ok(Some(rc))
-                } else {
-                    let s = state.load(Ordering::Acquire);
-                    match ChannelState::from_u32(s) {
-                        Some(s) if s.is_active() => Ok(None),
-                        _ => Err(Error::ChannelClosed),
+            let new_rc = wait.wait_until(
+                &self.reader_wait,
+                reader_notify,
+                reader_parked,
+                timeout,
+                || {
+                    let rc = read_cursor.load(Ordering::Acquire);
+                    let free = ring_data_size as u64 - (wc - rc);
+                    if free >= msg_len as u64 {
+                        Ok(Some(rc))
+                    } else {
+                        let s = state.load(Ordering::Acquire);
+                        match ChannelState::from_u32(s) {
+                            Some(s) if s.is_active() => Ok(None),
+                            _ => Err(Error::ChannelClosed),
+                        }
                     }
-                }
-            })?;
+                },
+            )?;
             self.cached_rc = new_rc;
         }
 
@@ -115,7 +127,11 @@ impl RingSender {
 
         // 最適化 #1: notify bump + parked のときだけ wake
         self.writer_notify().fetch_add(1, Ordering::Release);
-        wait.wake_if_parked(self.writer_notify(), self.writer_parked());
+        wait.wake_if_parked(
+            &self.writer_wait,
+            self.writer_notify(),
+            self.writer_parked(),
+        );
 
         Ok(())
     }
@@ -166,6 +182,8 @@ pub struct RingReceiver {
     base: *const u8,
     ring_header: *const RingHeader,
     global_header: *const GlobalHeader,
+    writer_wait: platform::WaitHandle,
+    reader_wait: platform::WaitHandle,
     data_offset: usize,
     ring_data_size: usize,
     ring_mask: usize,
@@ -181,6 +199,8 @@ impl RingReceiver {
         base: *const u8,
         ring_header: *const RingHeader,
         global_header: *const GlobalHeader,
+        writer_wait: platform::WaitHandle,
+        reader_wait: platform::WaitHandle,
         data_offset: usize,
         ring_data_size: usize,
     ) -> Self {
@@ -189,6 +209,8 @@ impl RingReceiver {
             base,
             ring_header,
             global_header,
+            writer_wait,
+            reader_wait,
             data_offset,
             ring_data_size,
             ring_mask: ring_data_size - 1,
@@ -266,7 +288,7 @@ impl RingReceiver {
         self.cached_rc = new_rc;
         self.reader_notify().fetch_add(1, Ordering::Release);
         // try_recv は非ブロッキングなので wake は常に呼ぶ (parked チェック省略)
-        platform::futex_wake(self.reader_notify());
+        platform::wake_handle(&self.reader_wait, self.reader_notify());
 
         Ok(Some(buf))
     }
@@ -284,15 +306,21 @@ impl RingReceiver {
         let rc = self.cached_rc;
 
         // write_cursor が十分進むまで待つ (1段階のみ)
-        let wc = wait.wait_until(self.writer_notify(), self.writer_parked(), timeout, || {
-            let wc = self.write_cursor().load(Ordering::Acquire);
-            if wc - rc >= MSG_HEADER_SIZE as u64 {
-                Ok(Some(wc))
-            } else {
-                self.check_channel_active()?;
-                Ok(None)
-            }
-        })?;
+        let wc = wait.wait_until(
+            &self.writer_wait,
+            self.writer_notify(),
+            self.writer_parked(),
+            timeout,
+            || {
+                let wc = self.write_cursor().load(Ordering::Acquire);
+                if wc - rc >= MSG_HEADER_SIZE as u64 {
+                    Ok(Some(wc))
+                } else {
+                    self.check_channel_active()?;
+                    Ok(None)
+                }
+            },
+        )?;
 
         let (data_len, seq) = self.read_msg_header(rc);
 
@@ -321,7 +349,11 @@ impl RingReceiver {
         self.cached_rc = new_rc;
 
         self.reader_notify().fetch_add(1, Ordering::Release);
-        wait.wake_if_parked(self.reader_notify(), self.reader_parked());
+        wait.wake_if_parked(
+            &self.reader_wait,
+            self.reader_notify(),
+            self.reader_parked(),
+        );
     }
 
     fn read_msg_header(&self, cursor: u64) -> (usize, u32) {

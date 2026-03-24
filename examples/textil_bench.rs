@@ -12,7 +12,7 @@
 //!   cargo run --release --example textil_bench
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -64,7 +64,6 @@ fn backend_handler(conn: ShmemConnection) {
     // Register
     let msg = rx.recv().unwrap();
     assert_eq!(msg_type(&msg), MSG_REGISTER);
-    let id = String::from_utf8_lossy(&msg[1..]).to_string();
     tx.send(&[MSG_REGISTERED]).unwrap();
 
     // mpsc で recv → send を分離
@@ -126,7 +125,6 @@ fn run_backend(name: &str, shutdown: Arc<AtomicBool>, expected_clients: u32) {
 // =========================================================================
 
 struct BenchResult {
-    scenario: String,
     messages: usize,
     total_bytes: u64,
     elapsed: Duration,
@@ -141,13 +139,7 @@ impl BenchResult {
     }
 }
 
-fn run_frontend_bench(
-    name: &str,
-    frontend_id: u32,
-    scenario: &str,
-    msg_size: usize,
-    count: usize,
-) -> BenchResult {
+fn run_frontend_bench(name: &str, frontend_id: u32, msg_size: usize, count: usize) -> BenchResult {
     let mut conn = connect(name, ChannelConfig::default()).unwrap();
 
     // Register
@@ -187,7 +179,6 @@ fn run_frontend_bench(
     let total_bytes = (5 + msg_size) as u64 * count as u64 + recv_bytes;
 
     BenchResult {
-        scenario: scenario.to_string(),
         messages: count * 2, // send + recv
         total_bytes,
         elapsed,
@@ -215,10 +206,9 @@ fn run_scenario(scenario: &str, num_frontends: u32, msg_size: usize, count: usiz
     let mut handles = Vec::new();
     for i in 0..num_frontends {
         let name_owned = name.to_string();
-        let scenario_owned = scenario.to_string();
         handles.push(thread::spawn(move || {
             thread::sleep(Duration::from_millis(i as u64 * 10));
-            run_frontend_bench(&name_owned, i, &scenario_owned, msg_size, count)
+            run_frontend_bench(&name_owned, i, msg_size, count)
         }));
     }
 

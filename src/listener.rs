@@ -1,4 +1,3 @@
-use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::channel::{Channel, ChannelConfig};
@@ -6,6 +5,7 @@ use crate::connection::ShmemConnection;
 use crate::error::{Error, Result};
 
 /// ハンドシェイク用ソケットのパス
+#[cfg(unix)]
 fn handshake_path(name: &str) -> std::path::PathBuf {
     #[cfg(unix)]
     {
@@ -26,6 +26,7 @@ fn handshake_path(name: &str) -> std::path::PathBuf {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     pub struct Listener {

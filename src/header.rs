@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 /// 共有メモリファイルのマジックナンバー ("SHMC")
 pub const MAGIC: u32 = 0x5348_4D43;
 /// プロトコルバージョン
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// GlobalHeader のサイズ (256 bytes に固定、将来の拡張余地を残す)
 pub const GLOBAL_HEADER_SIZE: usize = 256;
 /// RingHeader のサイズ (128 bytes = cache line 2本分)
@@ -60,6 +60,7 @@ pub struct GlobalHeader {
     pub ring_data_size: u32,
     _pad0: u32,
     pub server_pid: u64,
+    pub wait_key: u64,
     pub client_pid: AtomicU64,
     pub server_heartbeat: AtomicU64,
     pub client_heartbeat: AtomicU64,

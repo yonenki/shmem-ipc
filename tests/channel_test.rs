@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use shmem_ipc::{Channel, ChannelState, Error};
+use shmem_ipc::{Channel, ChannelConfig, ChannelState, Error, SpinThenWait};
 
 /// 基本的な send/recv
 #[test]
@@ -162,6 +162,43 @@ fn test_drop_closes_channel() {
     handle.join().unwrap();
 }
 
+#[test]
+fn test_close_wakes_peer_promptly() {
+    let name = "test_close_wakes_peer";
+    let _ = Channel::cleanup(name);
+
+    let config = ChannelConfig {
+        wait_strategy: SpinThenWait { spin_count: 0 },
+        ..Default::default()
+    };
+    let server = Channel::create_with_config(name, config.clone()).unwrap();
+
+    let handle = thread::spawn(move || {
+        let mut client = Channel::open_with_config(name, config).unwrap();
+        let start = Instant::now();
+        let result = client.recv_timeout(Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(Error::ChannelClosed)),
+            "expected ChannelClosed, got: {:?}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "close wake took too long: {elapsed:.2?}"
+        );
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.state() != ChannelState::Connected {
+        assert!(Instant::now() < deadline, "client did not connect in time");
+        thread::yield_now();
+    }
+
+    drop(server);
+    handle.join().unwrap();
+}
+
 // =========================================================================
 // 回帰テスト: Codex レビュー指摘事項
 // =========================================================================
@@ -252,6 +289,32 @@ fn test_drain_after_close() {
         "expected ChannelClosed after drain, got: {:?}",
         result
     );
+}
+
+/// 同名 channel を世代を跨いで再作成しても stale wait object に接続しないことを確認する。
+#[test]
+fn test_reconnect_same_name_across_generations() {
+    let name = "test_reconnect_same_name";
+    let _ = Channel::cleanup(name);
+
+    for generation in 0..3u32 {
+        let mut server = Channel::create(name).unwrap();
+        let request = format!("gen{generation}-req").into_bytes();
+        let reply = format!("gen{generation}-ack").into_bytes();
+        let expected_request = request.clone();
+        let expected_reply = reply.clone();
+
+        let handle = thread::spawn(move || {
+            let mut client = Channel::open(name).unwrap();
+            let msg = client.recv().unwrap();
+            assert_eq!(msg, expected_request);
+            client.send(&expected_reply).unwrap();
+        });
+
+        server.send(&request).unwrap();
+        assert_eq!(server.recv().unwrap(), reply);
+        handle.join().unwrap();
+    }
 }
 
 /// PingPong パフォーマンステスト (回帰テスト用)

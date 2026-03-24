@@ -47,6 +47,7 @@ pub struct Channel {
     mmap: MmapMut,
     sender: RingSender,
     receiver: RingReceiver,
+    wait_set: platform::ChannelWaitSet,
     role: Role,
     name: String,
     wait: SpinThenWait,
@@ -70,6 +71,8 @@ impl Channel {
 
         let path = platform::shm_path(name);
         let offsets = RingOffsets::new(config.ring_size);
+        let wait_key = platform::new_wait_key();
+        let wait_set = platform::ChannelWaitSet::new(name, wait_key)?;
 
         // ファイルを作成して mmap
         let file = OpenOptions::new()
@@ -88,6 +91,7 @@ impl Channel {
         gh.version = VERSION;
         gh.ring_data_size = config.ring_size as u32;
         gh.server_pid = platform::current_pid();
+        gh.wait_key = wait_key;
         gh.client_pid.store(0, Ordering::Release);
         gh.server_heartbeat.store(0, Ordering::Release);
         gh.client_heartbeat.store(0, Ordering::Release);
@@ -114,6 +118,8 @@ impl Channel {
                 base,
                 base.add(offsets.ring_a_header) as *const RingHeader,
                 global_header_ptr,
+                wait_set.ring_a_writer.clone(),
+                wait_set.ring_a_reader.clone(),
                 offsets.ring_a_data,
                 config.ring_size,
             )
@@ -123,6 +129,8 @@ impl Channel {
                 base as *const u8,
                 base.add(offsets.ring_b_header) as *const RingHeader,
                 global_header_ptr,
+                wait_set.ring_b_writer.clone(),
+                wait_set.ring_b_reader.clone(),
                 offsets.ring_b_data,
                 config.ring_size,
             )
@@ -132,6 +140,7 @@ impl Channel {
             mmap,
             sender,
             receiver,
+            wait_set,
             role: Role::Server,
             name: name.to_string(),
             wait: config.wait_strategy,
@@ -188,6 +197,8 @@ impl Channel {
             return Err(Error::InvalidHeader);
         }
 
+        let wait_set = platform::ChannelWaitSet::new(name, gh.wait_key)?;
+
         // state を ServerReady → Connected に CAS
         let state_result = gh.state.compare_exchange(
             ChannelState::ServerReady as u32,
@@ -211,6 +222,8 @@ impl Channel {
                 base,
                 base.add(offsets.ring_b_header) as *const RingHeader,
                 global_header_ptr,
+                wait_set.ring_b_writer.clone(),
+                wait_set.ring_b_reader.clone(),
                 offsets.ring_b_data,
                 config.ring_size,
             )
@@ -220,6 +233,8 @@ impl Channel {
                 base as *const u8,
                 base.add(offsets.ring_a_header) as *const RingHeader,
                 global_header_ptr,
+                wait_set.ring_a_writer.clone(),
+                wait_set.ring_a_reader.clone(),
                 offsets.ring_a_data,
                 config.ring_size,
             )
@@ -229,6 +244,7 @@ impl Channel {
             mmap,
             sender,
             receiver,
+            wait_set,
             role: Role::Client,
             name: name.to_string(),
             wait: config.wait_strategy,
@@ -298,13 +314,33 @@ impl Channel {
         let mmap = unsafe { std::ptr::read(&self.mmap) };
         let sender = unsafe { std::ptr::read(&self.sender) };
         let receiver = unsafe { std::ptr::read(&self.receiver) };
+        let wait_set = unsafe { std::ptr::read(&self.wait_set) };
         std::mem::forget(self);
 
-        crate::connection::ShmemConnection::new(mmap, sender, receiver, wait, name, is_server)
+        crate::connection::ShmemConnection::new(
+            mmap, sender, receiver, wait_set, wait, name, is_server,
+        )
     }
 
     fn global_header(&self) -> &GlobalHeader {
         unsafe { GlobalHeader::from_ptr(self.mmap.as_ptr()) }
+    }
+
+    fn wake_all_peer_waiters(&self) {
+        let offsets = RingOffsets::new(self.global_header().ring_data_size as usize);
+        let base = self.mmap.as_ptr() as *mut u8;
+
+        let ring_a = unsafe { &*(base.add(offsets.ring_a_header) as *const RingHeader) };
+        ring_a.writer.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_a_writer, &ring_a.writer.notify);
+        ring_a.reader.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_a_reader, &ring_a.reader.notify);
+
+        let ring_b = unsafe { &*(base.add(offsets.ring_b_header) as *const RingHeader) };
+        ring_b.writer.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_b_writer, &ring_b.writer.notify);
+        ring_b.reader.notify.fetch_add(1, Ordering::Release);
+        platform::wake_handle(&self.wait_set.ring_b_reader, &ring_b.reader.notify);
     }
 }
 
@@ -317,15 +353,7 @@ impl Drop for Channel {
 
         // peer の futex を起こす (spin-wait やfutex_wait から抜けさせる)
         // Ring A, Ring B 両方の writer/reader notify を wake
-        let offsets = RingOffsets::new(self.global_header().ring_data_size as usize);
-        let base = self.mmap.as_ptr() as *mut u8;
-        for ring_header_offset in [offsets.ring_a_header, offsets.ring_b_header] {
-            let rh = unsafe { &*(base.add(ring_header_offset) as *const RingHeader) };
-            rh.writer.notify.fetch_add(1, Ordering::Release);
-            platform::futex_wake(&rh.writer.notify);
-            rh.reader.notify.fetch_add(1, Ordering::Release);
-            platform::futex_wake(&rh.reader.notify);
-        }
+        self.wake_all_peer_waiters();
 
         // Server のみ共有メモリファイルを削除する
         // (Client が先に drop しても Server のファイルは残る)
