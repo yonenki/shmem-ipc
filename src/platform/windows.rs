@@ -3,12 +3,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
+#[cfg(feature = "tokio")]
+use std::sync::Mutex;
+#[cfg(feature = "tokio")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tokio")]
+use std::task::{Context, Poll, Waker};
+
+#[cfg(feature = "tokio")]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
     CreateWaitableTimerExW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, SetEvent,
     SetWaitableTimerEx, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
 };
+#[cfg(feature = "tokio")]
+use windows_sys::Win32::System::Threading::{RegisterWaitForSingleObject, UnregisterWaitEx};
 
 const INFINITE: u32 = 0xFFFF_FFFF;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
@@ -32,6 +43,21 @@ impl WaitSlot {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SignalKind {
+    Sync,
+    Async,
+}
+
+impl SignalKind {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WaitHandle {
     inner: Arc<WaitObjects>,
@@ -47,17 +73,115 @@ pub struct ChannelWaitSet {
 
 struct WaitObjects {
     event: HANDLE,
+    async_event: HANDLE,
     timeout_timer: HANDLE,
+    #[cfg(feature = "tokio")]
+    async_state: Box<AsyncWaitState>,
 }
 
 unsafe impl Send for WaitObjects {}
 unsafe impl Sync for WaitObjects {}
 
+#[cfg(feature = "tokio")]
+struct AsyncWaitState {
+    wait_object: Mutex<HANDLE>,
+    signaled: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncWaitState {
+    fn new() -> Self {
+        Self {
+            wait_object: Mutex::new(std::ptr::null_mut()),
+            signaled: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    fn prepare_wait(&self, event: HANDLE) -> io::Result<()> {
+        self.ensure_registered(event)
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.signaled.swap(false, Ordering::AcqRel) {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut waker = lock_unpoison(&self.waker);
+        if !waker
+            .as_ref()
+            .is_some_and(|stored| stored.will_wake(cx.waker()))
+        {
+            *waker = Some(cx.waker().clone());
+        }
+
+        if self.signaled.swap(false, Ordering::AcqRel) {
+            *waker = None;
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn clear_waiter(&self) {
+        self.signaled.store(false, Ordering::Release);
+        let mut waker = lock_unpoison(&self.waker);
+        *waker = None;
+    }
+
+    fn ensure_registered(&self, event: HANDLE) -> io::Result<()> {
+        let mut wait_object = lock_unpoison(&self.wait_object);
+        if !wait_object.is_null() {
+            return Ok(());
+        }
+
+        let mut new_wait = std::ptr::null_mut();
+        let ok = unsafe {
+            RegisterWaitForSingleObject(
+                &mut new_wait,
+                event,
+                Some(wait_callback),
+                self as *const Self as *const _,
+                INFINITE,
+                0,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        *wait_object = new_wait;
+        Ok(())
+    }
+}
+
 impl Drop for WaitObjects {
     fn drop(&mut self) {
+        #[cfg(feature = "tokio")]
+        {
+            let wait_object = self
+                .async_state
+                .wait_object
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !wait_object.is_null() {
+                let ok = unsafe { UnregisterWaitEx(*wait_object, INVALID_HANDLE_VALUE) };
+                if ok == 0 {
+                    let err = io::Error::last_os_error();
+                    panic!("shmem-ipc: UnregisterWaitEx failed: {err}");
+                }
+            }
+        }
+
         if !self.event.is_null() {
             unsafe {
                 CloseHandle(self.event);
+            }
+        }
+        if !self.async_event.is_null() {
+            unsafe {
+                CloseHandle(self.async_event);
             }
         }
         if !self.timeout_timer.is_null() {
@@ -70,9 +194,18 @@ impl Drop for WaitObjects {
 
 impl WaitHandle {
     fn open(channel_name: &str, wait_key: u64, slot: WaitSlot) -> io::Result<Self> {
-        let name = event_name(channel_name, wait_key, slot);
-        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        let sync_name = event_name(channel_name, wait_key, slot, SignalKind::Sync);
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, sync_name.as_ptr()) };
         if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let async_name = event_name(channel_name, wait_key, slot, SignalKind::Async);
+        let async_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, async_name.as_ptr()) };
+        if async_event.is_null() {
+            unsafe {
+                CloseHandle(event);
+            }
             return Err(io::Error::last_os_error());
         }
 
@@ -87,14 +220,21 @@ impl WaitHandle {
         if timeout_timer.is_null() {
             unsafe {
                 CloseHandle(event);
+                CloseHandle(async_event);
             }
             return Err(io::Error::last_os_error());
         }
 
+        #[cfg(feature = "tokio")]
+        let async_state = Box::new(AsyncWaitState::new());
+
         Ok(Self {
             inner: Arc::new(WaitObjects {
                 event,
+                async_event,
                 timeout_timer,
+                #[cfg(feature = "tokio")]
+                async_state,
             }),
         })
     }
@@ -130,6 +270,33 @@ pub fn wake_handle(handle: &WaitHandle, _word: &AtomicU32) {
         let err = io::Error::last_os_error();
         panic!("shmem-ipc: SetEvent failed: {err}");
     }
+
+    #[cfg(feature = "tokio")]
+    {
+        let ok = unsafe { SetEvent(handle.inner.async_event) };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            panic!("shmem-ipc: SetEvent failed: {err}");
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+pub fn prepare_wait_handle(handle: &WaitHandle) -> io::Result<()> {
+    handle
+        .inner
+        .async_state
+        .prepare_wait(handle.inner.async_event)
+}
+
+#[cfg(feature = "tokio")]
+pub fn poll_wait_handle(handle: &WaitHandle, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    handle.inner.async_state.poll(cx)
+}
+
+#[cfg(feature = "tokio")]
+pub fn clear_wait_handle(handle: &WaitHandle) {
+    handle.inner.async_state.clear_waiter();
 }
 
 fn wait_for_event(event: HANDLE, timeout_ms: u32) {
@@ -201,11 +368,12 @@ fn timeout_to_due_time(timeout: Duration) -> i64 {
     -ticks_100ns
 }
 
-fn event_name(channel_name: &str, wait_key: u64, slot: WaitSlot) -> Vec<u16> {
+fn event_name(channel_name: &str, wait_key: u64, slot: WaitSlot, kind: SignalKind) -> Vec<u16> {
     let name_hash = stable_name_hash(channel_name);
     format!(
-        "Local\\shmem_ipc_{name_hash:016x}_{wait_key:016x}_{}",
-        slot.suffix()
+        "Local\\shmem_ipc_{name_hash:016x}_{wait_key:016x}_{}_{}",
+        slot.suffix(),
+        kind.suffix()
     )
     .encode_utf16()
     .chain(std::iter::once(0))
@@ -219,6 +387,28 @@ fn stable_name_hash(channel_name: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(feature = "tokio")]
+fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "tokio")]
+unsafe extern "system" fn wait_callback(context: *mut core::ffi::c_void, _timed_out: bool) {
+    let state = unsafe { &*(context as *const AsyncWaitState) };
+    state.signaled.store(true, Ordering::Release);
+
+    let waker = {
+        let waker = lock_unpoison(&state.waker);
+        waker.as_ref().cloned()
+    };
+
+    if let Some(waker) = waker {
+        waker.wake();
+    }
 }
 
 pub fn current_pid() -> u64 {

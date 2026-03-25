@@ -99,6 +99,7 @@ fn test_try_recv() {
     let _ = Channel::cleanup(name);
 
     let mut server = Channel::create(name).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
     let handle = thread::spawn(move || {
         let mut client = Channel::open(name).unwrap();
@@ -106,6 +107,7 @@ fn test_try_recv() {
         // まだ何も来ていない
         let result = client.try_recv().unwrap();
         assert!(result.is_none());
+        ready_tx.send(()).unwrap();
 
         // データが届くまでポーリング (タイミング依存の sleep を排除)
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -122,9 +124,7 @@ fn test_try_recv() {
         assert_eq!(msg, b"ping");
     });
 
-    // client が open して最初の try_recv(None) を呼ぶのを待つため少し間を空ける
-    // これは try_recv の「データなし」パスをテストするために必要な最小限の待ち
-    thread::sleep(Duration::from_millis(10));
+    ready_rx.recv().unwrap();
     server.send(b"ping").unwrap();
     handle.join().unwrap();
 }

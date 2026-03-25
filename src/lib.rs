@@ -5,6 +5,8 @@ mod header;
 mod listener;
 mod platform;
 mod ring;
+#[cfg(feature = "tokio")]
+pub mod tokio;
 mod wait;
 
 pub use channel::{Channel, ChannelConfig, Role};

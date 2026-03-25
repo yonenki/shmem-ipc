@@ -4,6 +4,8 @@ use std::time::Duration;
 use memmap2::MmapMut;
 
 use crate::error::Result;
+#[cfg(feature = "tokio")]
+use crate::ring::WaitTarget;
 use crate::ring::{RingReceiver, RingSender};
 use crate::wait::SpinThenWait;
 
@@ -64,6 +66,21 @@ impl SendHalf {
     pub fn send_timeout(&mut self, payload: &[u8], timeout: Duration) -> Result<()> {
         self.sender.send(payload, &self.wait, Some(timeout))
     }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn sender_mut(&mut self) -> &mut RingSender {
+        &mut self.sender
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn send_wait_target(&self) -> WaitTarget {
+        self.sender.wait_target()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_spin_count(&self) -> u32 {
+        self.wait.spin_count
+    }
 }
 
 /// Receive side of a shared-memory connection.
@@ -90,6 +107,21 @@ impl RecvHalf {
 
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
         self.receiver.try_recv()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn receiver_mut(&mut self) -> &mut RingReceiver {
+        &mut self.receiver
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn recv_wait_target(&self) -> WaitTarget {
+        self.receiver.wait_target()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_spin_count(&self) -> u32 {
+        self.wait.spin_count
     }
 }
 
@@ -179,5 +211,30 @@ impl ShmemConnection {
 
     pub fn name(&self) -> &str {
         &self.shared.name
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn sender_mut(&mut self) -> &mut RingSender {
+        self.sender.as_mut().expect("already split")
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn receiver_mut(&mut self) -> &mut RingReceiver {
+        self.receiver.as_mut().expect("already split")
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn send_wait_target(&self) -> WaitTarget {
+        self.sender.as_ref().expect("already split").wait_target()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn recv_wait_target(&self) -> WaitTarget {
+        self.receiver.as_ref().expect("already split").wait_target()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_spin_count(&self) -> u32 {
+        self.wait.spin_count
     }
 }

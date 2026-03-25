@@ -8,6 +8,8 @@ use memmap2::MmapMut;
 use crate::error::{Error, Result};
 use crate::header::{ChannelState, GlobalHeader, MAGIC, RingHeader, RingOffsets, VERSION};
 use crate::platform;
+#[cfg(feature = "tokio")]
+use crate::ring::WaitTarget;
 use crate::ring::{DEFAULT_RING_DATA_SIZE, RingReceiver, RingSender};
 use crate::wait::SpinThenWait;
 
@@ -320,6 +322,31 @@ impl Channel {
         crate::connection::ShmemConnection::new(
             mmap, sender, receiver, wait_set, wait, name, is_server,
         )
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn sender_mut(&mut self) -> &mut RingSender {
+        &mut self.sender
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn receiver_mut(&mut self) -> &mut RingReceiver {
+        &mut self.receiver
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn send_wait_target(&self) -> WaitTarget {
+        self.sender.wait_target()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn recv_wait_target(&self) -> WaitTarget {
+        self.receiver.wait_target()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_spin_count(&self) -> u32 {
+        self.wait.spin_count
     }
 
     fn global_header(&self) -> &GlobalHeader {

@@ -1,18 +1,78 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::header::{ChannelState, GlobalHeader, RingHeader};
 use crate::platform;
 use crate::wait::WaitStrategy;
 
-/// デフォルトのリングデータサイズ (16 MiB)
 pub const DEFAULT_RING_DATA_SIZE: usize = 16 * 1024 * 1024;
-/// メッセージヘッダ: 4 bytes (length) + 4 bytes (sequence number)
 pub const MSG_HEADER_SIZE: usize = 8;
 
-// =========================================================================
-// RingSender
-// =========================================================================
+#[cfg(feature = "tokio")]
+#[derive(Clone)]
+pub(crate) struct WaitTarget {
+    handle: platform::WaitHandle,
+    notify: *const AtomicU32,
+    parked: *const AtomicU32,
+}
+
+#[cfg(feature = "tokio")]
+impl WaitTarget {
+    pub(crate) fn new(
+        handle: platform::WaitHandle,
+        notify: *const AtomicU32,
+        parked: *const AtomicU32,
+    ) -> Self {
+        Self {
+            handle,
+            notify,
+            parked,
+        }
+    }
+
+    pub(crate) fn handle(&self) -> &platform::WaitHandle {
+        &self.handle
+    }
+
+    pub(crate) fn notify(&self) -> &AtomicU32 {
+        unsafe { &*self.notify }
+    }
+
+    pub(crate) fn parked(&self) -> &AtomicU32 {
+        unsafe { &*self.parked }
+    }
+}
+
+#[cfg(feature = "tokio")]
+unsafe impl Send for WaitTarget {}
+#[cfg(feature = "tokio")]
+unsafe impl Sync for WaitTarget {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrySendResult {
+    Sent,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeekedMessage {
+    read_cursor: u64,
+    payload_len: usize,
+    seq: u32,
+}
+
+impl PeekedMessage {
+    pub(crate) fn payload_len(self) -> usize {
+        self.payload_len
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TryPeekResult {
+    Empty,
+    Ready(PeekedMessage),
+}
 
 pub struct RingSender {
     base: *mut u8,
@@ -24,10 +84,7 @@ pub struct RingSender {
     ring_data_size: usize,
     ring_mask: usize,
     next_seq: u32,
-    // 最適化 #3: 自分のカーソルをローカルにキャッシュ
-    // write_cursor は自分だけが書くので Atomic load 不要
     cached_wc: u64,
-    // peer の read_cursor のキャッシュ。空きが足りないときだけ更新
     cached_rc: u64,
 }
 
@@ -63,77 +120,104 @@ impl RingSender {
         &mut self,
         payload: &[u8],
         wait: &impl WaitStrategy,
-        timeout: Option<std::time::Duration>,
+        timeout: Option<Duration>,
     ) -> Result<()> {
+        let msg_len = self.message_size(payload.len())?;
+
+        loop {
+            match self.try_send_once(payload)? {
+                TrySendResult::Sent => return Ok(()),
+                TrySendResult::Full => {
+                    let wc = self.cached_wc;
+                    let ring_data_size = self.ring_data_size;
+                    let read_cursor = self.read_cursor();
+                    let reader_notify = self.reader_notify();
+                    let reader_parked = self.reader_parked();
+                    let state = self.state();
+
+                    let new_rc = wait.wait_until(
+                        &self.reader_wait,
+                        reader_notify,
+                        reader_parked,
+                        timeout,
+                        || {
+                            let rc = read_cursor.load(Ordering::Acquire);
+                            let free = ring_data_size as u64 - (wc - rc);
+                            if free >= msg_len as u64 {
+                                Ok(Some(rc))
+                            } else {
+                                match ChannelState::from_u32(state.load(Ordering::Acquire)) {
+                                    Some(channel_state) if channel_state.is_active() => Ok(None),
+                                    _ => Err(Error::ChannelClosed),
+                                }
+                            }
+                        },
+                    )?;
+                    self.cached_rc = new_rc;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_send_once(&mut self, payload: &[u8]) -> Result<TrySendResult> {
         self.check_channel_active()?;
 
-        let msg_len = MSG_HEADER_SIZE + payload.len();
-        if msg_len > self.ring_data_size {
-            return Err(Error::MessageTooLarge {
-                size: payload.len(),
-                max: self.ring_data_size - MSG_HEADER_SIZE,
-            });
-        }
-
+        let msg_len = self.message_size(payload.len())?;
         let wc = self.cached_wc;
 
-        // 最適化 #3: キャッシュ済み rc でまず空きをチェック
-        let free = self.ring_data_size as u64 - (wc - self.cached_rc);
-        if (free as usize) < msg_len {
-            // キャッシュが古い → shared memory から最新 rc を取得して待機
-            // borrow checker のため、self のフィールドを個別に参照
-            let ring_header = self.ring_header;
-            let global_header = self.global_header;
-            let ring_data_size = self.ring_data_size;
-            let read_cursor = unsafe { &(*ring_header).reader.read_cursor };
-            let reader_notify = unsafe { &(*ring_header).reader.notify };
-            let reader_parked = unsafe { &(*ring_header).reader.parked };
-            let state = unsafe { &(*global_header).state };
-
-            let new_rc = wait.wait_until(
-                &self.reader_wait,
-                reader_notify,
-                reader_parked,
-                timeout,
-                || {
-                    let rc = read_cursor.load(Ordering::Acquire);
-                    let free = ring_data_size as u64 - (wc - rc);
-                    if free >= msg_len as u64 {
-                        Ok(Some(rc))
-                    } else {
-                        let s = state.load(Ordering::Acquire);
-                        match ChannelState::from_u32(s) {
-                            Some(s) if s.is_active() => Ok(None),
-                            _ => Err(Error::ChannelClosed),
-                        }
-                    }
-                },
-            )?;
-            self.cached_rc = new_rc;
+        if !self.has_space(wc, msg_len) {
+            let fresh_rc = self.read_cursor().load(Ordering::Acquire);
+            self.cached_rc = fresh_rc;
+            if !self.has_space(wc, msg_len) {
+                return Ok(TrySendResult::Full);
+            }
         }
 
-        // フレームを書き込む
+        self.publish_message(wc, payload);
+        Ok(TrySendResult::Sent)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_target(&self) -> WaitTarget {
+        WaitTarget::new(
+            self.reader_wait.clone(),
+            self.reader_notify() as *const AtomicU32,
+            self.reader_parked() as *const AtomicU32,
+        )
+    }
+
+    fn publish_message(&mut self, wc: u64, payload: &[u8]) {
         let len_bytes = (payload.len() as u32).to_le_bytes();
         let seq_bytes = self.next_seq.to_le_bytes();
         self.write_ring(wc, &len_bytes);
         self.write_ring(wc + 4, &seq_bytes);
         self.write_ring(wc + MSG_HEADER_SIZE as u64, payload);
 
-        // write_cursor を進める (Release)
-        let new_wc = wc + msg_len as u64;
+        let new_wc = wc + (MSG_HEADER_SIZE + payload.len()) as u64;
         self.write_cursor().store(new_wc, Ordering::Release);
         self.cached_wc = new_wc;
         self.next_seq = self.next_seq.wrapping_add(1);
 
-        // 最適化 #1: notify bump + parked のときだけ wake
         self.writer_notify().fetch_add(1, Ordering::Release);
-        wait.wake_if_parked(
-            &self.writer_wait,
-            self.writer_notify(),
-            self.writer_parked(),
-        );
+        if self.writer_parked().load(Ordering::Acquire) != 0 {
+            platform::wake_handle(&self.writer_wait, self.writer_notify());
+        }
+    }
 
-        Ok(())
+    fn has_space(&self, wc: u64, msg_len: usize) -> bool {
+        let free = self.ring_data_size as u64 - (wc - self.cached_rc);
+        free >= msg_len as u64
+    }
+
+    fn message_size(&self, payload_len: usize) -> Result<usize> {
+        let msg_len = MSG_HEADER_SIZE + payload_len;
+        if msg_len > self.ring_data_size {
+            return Err(Error::MessageTooLarge {
+                size: payload_len,
+                max: self.ring_data_size - MSG_HEADER_SIZE,
+            });
+        }
+        Ok(msg_len)
     }
 
     fn write_ring(&self, cursor: u64, data: &[u8]) {
@@ -158,25 +242,38 @@ impl RingSender {
     fn write_cursor(&self) -> &AtomicU64 {
         unsafe { &(*self.ring_header).writer.write_cursor }
     }
+
+    fn read_cursor(&self) -> &AtomicU64 {
+        unsafe { &(*self.ring_header).reader.read_cursor }
+    }
+
     fn writer_notify(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).writer.notify }
     }
+
     fn writer_parked(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).writer.parked }
     }
 
+    fn reader_notify(&self) -> &AtomicU32 {
+        unsafe { &(*self.ring_header).reader.notify }
+    }
+
+    fn reader_parked(&self) -> &AtomicU32 {
+        unsafe { &(*self.ring_header).reader.parked }
+    }
+
+    fn state(&self) -> &AtomicU32 {
+        unsafe { &(*self.global_header).state }
+    }
+
     fn check_channel_active(&self) -> Result<()> {
-        let state = unsafe { (*self.global_header).state.load(Ordering::Acquire) };
-        match ChannelState::from_u32(state) {
-            Some(s) if s.is_active() => Ok(()),
+        match ChannelState::from_u32(self.state().load(Ordering::Acquire)) {
+            Some(state) if state.is_active() => Ok(()),
             _ => Err(Error::ChannelClosed),
         }
     }
 }
-
-// =========================================================================
-// RingReceiver
-// =========================================================================
 
 pub struct RingReceiver {
     base: *const u8,
@@ -188,7 +285,6 @@ pub struct RingReceiver {
     ring_data_size: usize,
     ring_mask: usize,
     expected_seq: u32,
-    // 最適化 #3: 自分の read_cursor をローカルにキャッシュ
     cached_rc: u64,
 }
 
@@ -219,17 +315,11 @@ impl RingReceiver {
         }
     }
 
-    pub fn recv(
-        &mut self,
-        wait: &impl WaitStrategy,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<Vec<u8>> {
-        let (rc, data_len) = self.wait_for_message(wait, timeout)?;
-
-        let mut buf = vec![0u8; data_len];
-        self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf);
-
-        self.advance_cursor(rc, data_len, wait);
+    pub fn recv(&mut self, wait: &impl WaitStrategy, timeout: Option<Duration>) -> Result<Vec<u8>> {
+        let message = self.wait_for_message(wait, timeout)?;
+        let mut buf = vec![0u8; message.payload_len()];
+        self.copy_current_message(message, &mut buf)?;
+        self.commit_current_message(message)?;
         Ok(buf)
     }
 
@@ -237,131 +327,148 @@ impl RingReceiver {
         &mut self,
         buf: &mut [u8],
         wait: &impl WaitStrategy,
-        timeout: Option<std::time::Duration>,
+        timeout: Option<Duration>,
     ) -> Result<usize> {
-        let (rc, data_len) = self.wait_for_message(wait, timeout)?;
+        let message = self.wait_for_message(wait, timeout)?;
+        let payload_len = message.payload_len();
 
-        if data_len > buf.len() {
-            self.advance_cursor(rc, data_len, wait);
+        if payload_len > buf.len() {
+            self.commit_current_message(message)?;
             return Err(Error::MessageTooLarge {
-                size: data_len,
+                size: payload_len,
                 max: buf.len(),
             });
         }
 
-        self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf[..data_len]);
-        self.advance_cursor(rc, data_len, wait);
-        Ok(data_len)
+        self.copy_current_message(message, &mut buf[..payload_len])?;
+        self.commit_current_message(message)?;
+        Ok(payload_len)
     }
 
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
-        let wc = self.write_cursor().load(Ordering::Acquire);
+        match self.try_peek_message()? {
+            TryPeekResult::Empty => Ok(None),
+            TryPeekResult::Ready(message) => {
+                let mut buf = vec![0u8; message.payload_len()];
+                self.copy_current_message(message, &mut buf)?;
+                self.commit_current_message(message)?;
+                Ok(Some(buf))
+            }
+        }
+    }
+
+    pub(crate) fn try_peek_message(&self) -> Result<TryPeekResult> {
         let rc = self.cached_rc;
+        let wc = self.write_cursor().load(Ordering::Acquire);
 
         if wc - rc < MSG_HEADER_SIZE as u64 {
-            return Ok(None);
+            return Ok(TryPeekResult::Empty);
         }
 
-        let (data_len, seq) = self.read_msg_header(rc);
-
-        if data_len > self.ring_data_size - MSG_HEADER_SIZE {
+        let (payload_len, seq) = self.read_msg_header(rc);
+        if payload_len > self.ring_data_size - MSG_HEADER_SIZE {
             return Err(Error::MessageTooLarge {
-                size: data_len,
+                size: payload_len,
                 max: self.ring_data_size - MSG_HEADER_SIZE,
             });
         }
 
-        // 最適化 #2: write_cursor が進んだ = フレーム全体が書き込み済み
-        // 2段階チェック不要。ただし部分フレームは corruption として扱う
-        let msg_len = MSG_HEADER_SIZE + data_len;
+        let msg_len = MSG_HEADER_SIZE + payload_len;
         if wc - rc < msg_len as u64 {
-            return Ok(None);
+            return Ok(TryPeekResult::Empty);
         }
 
-        self.validate_seq(seq)?;
-
-        let mut buf = vec![0u8; data_len];
-        self.read_ring(rc + MSG_HEADER_SIZE as u64, &mut buf);
-
-        let new_rc = rc + msg_len as u64;
-        self.read_cursor().store(new_rc, Ordering::Release);
-        self.cached_rc = new_rc;
-        self.reader_notify().fetch_add(1, Ordering::Release);
-        // try_recv は非ブロッキングなので wake は常に呼ぶ (parked チェック省略)
-        platform::wake_handle(&self.reader_wait, self.reader_notify());
-
-        Ok(Some(buf))
+        Ok(TryPeekResult::Ready(PeekedMessage {
+            read_cursor: rc,
+            payload_len,
+            seq,
+        }))
     }
 
-    /// 最適化 #2: 1段階 wait (write_cursor が進んだ = フレーム完成)
-    ///
-    /// writer は header + payload を全て書いてから write_cursor を Release store する。
-    /// よって write_cursor - read_cursor >= MSG_HEADER_SIZE ならフレーム全体が見える。
-    /// 2段階目の "payload 全体が来るまで待つ" は不要。
+    pub(crate) fn copy_current_message(
+        &self,
+        message: PeekedMessage,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        if message.payload_len() > buf.len() {
+            return Err(Error::MessageTooLarge {
+                size: message.payload_len(),
+                max: buf.len(),
+            });
+        }
+
+        self.read_ring(
+            message.read_cursor + MSG_HEADER_SIZE as u64,
+            &mut buf[..message.payload_len()],
+        );
+        Ok(message.payload_len())
+    }
+
+    pub(crate) fn commit_current_message(&mut self, message: PeekedMessage) -> Result<()> {
+        self.validate_seq(message.seq)?;
+
+        let new_rc = message.read_cursor + (MSG_HEADER_SIZE + message.payload_len()) as u64;
+        self.read_cursor().store(new_rc, Ordering::Release);
+        self.cached_rc = new_rc;
+
+        self.reader_notify().fetch_add(1, Ordering::Release);
+        if self.reader_parked().load(Ordering::Acquire) != 0 {
+            platform::wake_handle(&self.reader_wait, self.reader_notify());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn wait_target(&self) -> WaitTarget {
+        WaitTarget::new(
+            self.writer_wait.clone(),
+            self.writer_notify() as *const AtomicU32,
+            self.writer_parked() as *const AtomicU32,
+        )
+    }
+
+    pub(crate) fn try_peek_or_closed(&self) -> Result<Option<PeekedMessage>> {
+        match self.try_peek_message()? {
+            TryPeekResult::Ready(message) => Ok(Some(message)),
+            TryPeekResult::Empty => match self.check_channel_active() {
+                Ok(()) => Ok(None),
+                Err(Error::ChannelClosed) => match self.try_peek_message()? {
+                    TryPeekResult::Ready(message) => Ok(Some(message)),
+                    TryPeekResult::Empty => Err(Error::ChannelClosed),
+                },
+                Err(err) => Err(err),
+            },
+        }
+    }
+
+    pub(crate) fn check_channel_active(&self) -> Result<()> {
+        match ChannelState::from_u32(self.state().load(Ordering::Acquire)) {
+            Some(state) if state.is_active() => Ok(()),
+            _ => Err(Error::ChannelClosed),
+        }
+    }
+
     fn wait_for_message(
         &mut self,
         wait: &impl WaitStrategy,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<(u64, usize)> {
-        let rc = self.cached_rc;
-
-        // write_cursor が十分進むまで待つ (1段階のみ)
-        let wc = wait.wait_until(
+        timeout: Option<Duration>,
+    ) -> Result<PeekedMessage> {
+        wait.wait_until(
             &self.writer_wait,
             self.writer_notify(),
             self.writer_parked(),
             timeout,
-            || {
-                let wc = self.write_cursor().load(Ordering::Acquire);
-                if wc - rc >= MSG_HEADER_SIZE as u64 {
-                    Ok(Some(wc))
-                } else {
-                    self.check_channel_active()?;
-                    Ok(None)
-                }
-            },
-        )?;
-
-        let (data_len, seq) = self.read_msg_header(rc);
-
-        if data_len > self.ring_data_size - MSG_HEADER_SIZE {
-            return Err(Error::MessageTooLarge {
-                size: data_len,
-                max: self.ring_data_size - MSG_HEADER_SIZE,
-            });
-        }
-
-        // フレーム全体が見えるか検証 (write_cursor はフレーム完成後に進むので通常は成立)
-        let msg_len = (MSG_HEADER_SIZE + data_len) as u64;
-        debug_assert!(
-            wc - rc >= msg_len,
-            "partial frame visible: wc={wc}, rc={rc}, msg_len={msg_len}"
-        );
-
-        self.validate_seq(seq)?;
-        Ok((rc, data_len))
-    }
-
-    /// read_cursor を進めて writer を (必要なら) 起こす
-    fn advance_cursor(&mut self, rc: u64, data_len: usize, wait: &impl WaitStrategy) {
-        let new_rc = rc + (MSG_HEADER_SIZE + data_len) as u64;
-        self.read_cursor().store(new_rc, Ordering::Release);
-        self.cached_rc = new_rc;
-
-        self.reader_notify().fetch_add(1, Ordering::Release);
-        wait.wake_if_parked(
-            &self.reader_wait,
-            self.reader_notify(),
-            self.reader_parked(),
-        );
+            || self.try_peek_or_closed(),
+        )
     }
 
     fn read_msg_header(&self, cursor: u64) -> (usize, u32) {
         let mut header = [0u8; MSG_HEADER_SIZE];
         self.read_ring(cursor, &mut header);
-        let data_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let seq = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        (data_len, seq)
+        (payload_len, seq)
     }
 
     fn validate_seq(&mut self, seq: u32) -> Result<()> {
@@ -397,27 +504,28 @@ impl RingReceiver {
     fn write_cursor(&self) -> &AtomicU64 {
         unsafe { &(*self.ring_header).writer.write_cursor }
     }
+
     fn read_cursor(&self) -> &AtomicU64 {
         unsafe { &(*self.ring_header).reader.read_cursor }
     }
+
     fn writer_notify(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).writer.notify }
     }
+
     fn writer_parked(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).writer.parked }
     }
+
     fn reader_notify(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).reader.notify }
     }
+
     fn reader_parked(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).reader.parked }
     }
 
-    fn check_channel_active(&self) -> Result<()> {
-        let state = unsafe { (*self.global_header).state.load(Ordering::Acquire) };
-        match ChannelState::from_u32(state) {
-            Some(s) if s.is_active() => Ok(()),
-            _ => Err(Error::ChannelClosed),
-        }
+    fn state(&self) -> &AtomicU32 {
+        unsafe { &(*self.global_header).state }
     }
 }
