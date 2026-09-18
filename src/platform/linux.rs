@@ -1,3 +1,5 @@
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
@@ -84,11 +86,145 @@ pub fn current_pid() -> u64 {
     unsafe { libc::getpid() as u64 }
 }
 
-/// 指定した PID のプロセスが生きているかチェックする
-#[allow(dead_code)] // heartbeat 機能で使用予定
-///
-/// kill(pid, 0) はシグナルを送らずに存在確認だけ行う。
-/// プロセスが存在すれば 0 を返し、存在しなければ ESRCH で -1 を返す。
-pub fn is_process_alive(pid: u64) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+/// A stable kernel process identity acquired from the bootstrap socket, not
+/// from the shared header's asynchronously published client_pid.
+pub(crate) struct PeerProcess(OwnedFd);
+
+impl PeerProcess {
+    pub(crate) fn from_socket(socket: &impl AsRawFd) -> crate::error::Result<Self> {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if len as usize != std::mem::size_of::<libc::ucred>() {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "invalid peer credentials").into(),
+            );
+        }
+        let pid = unsafe { credentials.assume_init() }.pid;
+        if pid <= 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "peer PID unavailable").into());
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(if err.raw_os_error() == Some(libc::ESRCH) {
+                crate::error::Error::PeerDisconnected
+            } else {
+                // ENOSYS, EPERM and resource exhaustion are setup failures;
+                // never silently establish a connection without observation.
+                err.into()
+            });
+        }
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd as _) }))
+    }
+
+    pub(crate) fn check_ready(&self) -> crate::error::Result<()> {
+        let mut fd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut fd, 1, 0) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+            if fd.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF).into());
+            }
+            if fd.revents & libc::POLLERR != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            if fd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return Err(crate::error::Error::PeerDisconnected);
+            }
+            return Ok(());
+        }
+    }
+
+    pub(crate) fn wait(&self, cancel: &PeerCancellation) -> io::Result<super::peer::PeerWait> {
+        let mut fds = [
+            libc::pollfd {
+                fd: cancel.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if fds.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            if fds.iter().any(|fd| fd.revents & libc::POLLERR != 0) {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            if fds[0].revents & libc::POLLIN != 0 {
+                return Ok(super::peer::PeerWait::Cancelled);
+            }
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return Ok(super::peer::PeerWait::Exited);
+            }
+        }
+    }
+}
+
+pub(crate) struct PeerCancellation(OwnedFd);
+
+impl PeerCancellation {
+    pub(crate) fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    pub(crate) fn cancel(&self) -> io::Result<()> {
+        let value = 1u64;
+        loop {
+            let rc = unsafe {
+                libc::write(
+                    self.0.as_raw_fd(),
+                    (&value as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if rc >= 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(err),
+            }
+        }
+    }
 }

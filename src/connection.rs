@@ -14,6 +14,7 @@ struct ConnectionDropGuard {
     wait_set: crate::platform::ChannelWaitSet,
     name: String,
     is_server: bool,
+    peer_monitor: Option<crate::platform::PeerMonitor>,
 }
 
 impl Drop for ConnectionDropGuard {
@@ -21,6 +22,10 @@ impl Drop for ConnectionDropGuard {
         use crate::header::{ChannelState, GlobalHeader, RingHeader, RingOffsets};
         use crate::platform;
         use std::sync::atomic::Ordering;
+
+        // The monitor never owns this guard. Join it while both mappings and
+        // wait objects are still valid, including on failed establishment.
+        self.peer_monitor.take();
 
         let base = self.mmap.as_ptr();
         let gh = unsafe { GlobalHeader::from_ptr(base) };
@@ -149,11 +154,39 @@ impl ShmemConnection {
                 wait_set,
                 name,
                 is_server,
+                peer_monitor: None,
             }),
             sender: Some(sender),
             receiver: Some(receiver),
             wait,
         }
+    }
+
+    /// Listener-only attachment. Direct Channel conversion remains unmonitored.
+    pub(crate) fn watch_peer(mut self, process: crate::platform::PeerProcess) -> Result<Self> {
+        use crate::header::{GlobalHeader, RingHeader, RingOffsets};
+        use crate::platform::{PeerMonitor, PeerState, PeerWake};
+
+        let guard = Arc::get_mut(&mut self.shared).expect("connection not yet exposed");
+        let base = guard.mmap.as_ptr();
+        let header = unsafe { GlobalHeader::from_ptr(base) };
+        let offsets = RingOffsets::new(header.ring_data_size as usize);
+        let state = Arc::new(PeerState::default());
+        let wake = unsafe {
+            PeerWake::new(
+                state.clone(),
+                base.add(offsets.ring_a_header) as *const RingHeader,
+                base.add(offsets.ring_b_header) as *const RingHeader,
+                guard.wait_set.clone(),
+            )
+        };
+        guard.peer_monitor = Some(PeerMonitor::start(process, wake)?);
+        self.sender
+            .as_mut()
+            .expect("not split")
+            .watch_peer(state.clone());
+        self.receiver.as_mut().expect("not split").watch_peer(state);
+        Ok(self)
     }
 
     /// Split the connection into independent send and receive halves.

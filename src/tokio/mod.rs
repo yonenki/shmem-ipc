@@ -381,7 +381,11 @@ fn drain_ready_with_spin(
         match spin_peek_or_closed(receiver, spin_count) {
             Ok(Some(message)) => out.push(commit_message_to_vec(receiver, message)?),
             Ok(None) => break,
-            Err(Error::ChannelClosed) if out.len() != start_len => break,
+            Err(Error::ChannelClosed | Error::PeerDisconnected | Error::Io(_))
+                if out.len() != start_len =>
+            {
+                break;
+            }
             Err(err) => return Err(err),
         }
     }

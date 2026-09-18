@@ -2,6 +2,21 @@ use std::time::Duration;
 
 use crate::channel::ChannelConfig;
 use crate::error::{Error, Result};
+use crate::listener::{CLIENT_READY, SERVER_READY, bootstrap_error, check_ack};
+
+async fn send_ack(stream: &mut (impl ::tokio::io::AsyncWrite + Unpin), ack: u8) -> Result<()> {
+    use ::tokio::io::AsyncWriteExt;
+    stream.write_all(&[ack]).await.map_err(bootstrap_error)?;
+    stream.flush().await.map_err(bootstrap_error)?;
+    Ok(())
+}
+
+async fn recv_ack(stream: &mut (impl ::tokio::io::AsyncRead + Unpin), expected: u8) -> Result<()> {
+    use ::tokio::io::AsyncReadExt;
+    let mut ack = [0];
+    stream.read_exact(&mut ack).await.map_err(bootstrap_error)?;
+    check_ack(ack[0], expected)
+}
 
 pub async fn connect(name: &str, config: ChannelConfig) -> Result<super::ShmemConnection> {
     Ok(super::ShmemConnection::from_sync(
@@ -82,12 +97,17 @@ mod imp {
         }
 
         async fn finish_accept(&mut self, mut stream: UnixStream) -> Result<ShmemConnection> {
+            let peer = crate::platform::PeerProcess::from_socket(&stream)?;
             let conn_name = format!("{}.conn.{}", self.name, self.counter);
             self.counter += 1;
 
-            let channel = crate::Channel::create_with_config(&conn_name, self.config.clone())?;
+            let connection = crate::Channel::create_with_config(&conn_name, self.config.clone())?
+                .into_connection()
+                .watch_peer(peer)?;
             send_conn_name(&mut stream, &conn_name).await?;
-            Ok(channel.into_connection())
+            recv_ack(&mut stream, CLIENT_READY).await?;
+            send_ack(&mut stream, SERVER_READY).await?;
+            Ok(connection)
         }
 
         pub fn cleanup(name: &str) {
@@ -121,27 +141,38 @@ mod imp {
             }
         };
 
+        let peer = crate::platform::PeerProcess::from_socket(&stream)?;
         let conn_name = recv_conn_name(&mut stream).await?;
-        let channel = crate::Channel::open_with_config(&conn_name, config)?;
-        Ok(channel.into_connection())
+        let connection = crate::Channel::open_with_config(&conn_name, config)?
+            .into_connection()
+            .watch_peer(peer)?;
+        send_ack(&mut stream, CLIENT_READY).await?;
+        recv_ack(&mut stream, SERVER_READY).await?;
+        Ok(connection)
     }
 
     async fn send_conn_name(stream: &mut UnixStream, conn_name: &str) -> Result<()> {
         let bytes = conn_name.as_bytes();
         let len = bytes.len() as u16;
-        stream.write_all(&len.to_le_bytes()).await?;
-        stream.write_all(bytes).await?;
-        stream.flush().await?;
+        stream
+            .write_all(&len.to_le_bytes())
+            .await
+            .map_err(bootstrap_error)?;
+        stream.write_all(bytes).await.map_err(bootstrap_error)?;
+        stream.flush().await.map_err(bootstrap_error)?;
         Ok(())
     }
 
     async fn recv_conn_name(stream: &mut UnixStream) -> Result<String> {
         let mut len_buf = [0u8; 2];
-        stream.read_exact(&mut len_buf).await?;
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(bootstrap_error)?;
         let len = u16::from_le_bytes(len_buf) as usize;
 
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+        stream.read_exact(&mut buf).await.map_err(bootstrap_error)?;
         String::from_utf8(buf)
             .map_err(|err| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))
     }
@@ -200,28 +231,36 @@ mod imp {
             &mut self,
             timeout: Option<Duration>,
         ) -> Result<ShmemConnection> {
-            match timeout {
+            let result = match timeout {
                 Some(timeout) => {
                     match ::tokio::time::timeout(timeout, self.current.connect()).await {
-                        Ok(result) => result?,
+                        Ok(result) => result,
                         Err(_) => return Err(Error::TimedOut),
                     }
                 }
-                None => self.current.connect().await?,
-            }
+                None => self.current.connect().await,
+            };
 
             let connected =
                 std::mem::replace(&mut self.current, create_server(&self.pipe_path, false)?);
+            // A client may have died before ConnectNamedPipe completed. Retire
+            // that instance as well, while retaining a fresh accept endpoint.
+            result.map_err(bootstrap_error)?;
             self.finish_accept(connected).await
         }
 
         async fn finish_accept(&mut self, mut pipe: NamedPipeServer) -> Result<ShmemConnection> {
+            let peer = crate::platform::PeerProcess::from_pipe(&pipe, true)?;
             let conn_name = format!("{}.conn.{}", self.name, self.counter);
             self.counter += 1;
 
-            let channel = crate::Channel::create_with_config(&conn_name, self.config.clone())?;
+            let connection = crate::Channel::create_with_config(&conn_name, self.config.clone())?
+                .into_connection()
+                .watch_peer(peer)?;
             send_conn_name(&mut pipe, &conn_name).await?;
-            Ok(channel.into_connection())
+            recv_ack(&mut pipe, CLIENT_READY).await?;
+            send_ack(&mut pipe, SERVER_READY).await?;
+            Ok(connection)
         }
     }
 
@@ -242,9 +281,14 @@ mod imp {
             }
         };
 
+        let peer = crate::platform::PeerProcess::from_pipe(&client, false)?;
         let conn_name = recv_conn_name(&mut client).await?;
-        let channel = crate::Channel::open_with_config(&conn_name, config)?;
-        Ok(channel.into_connection())
+        let connection = crate::Channel::open_with_config(&conn_name, config)?
+            .into_connection()
+            .watch_peer(peer)?;
+        send_ack(&mut client, CLIENT_READY).await?;
+        recv_ack(&mut client, SERVER_READY).await?;
+        Ok(connection)
     }
 
     fn create_server(pipe_path: &str, first_instance: bool) -> std::io::Result<NamedPipeServer> {
@@ -265,19 +309,23 @@ mod imp {
     async fn send_conn_name(pipe: &mut NamedPipeServer, conn_name: &str) -> Result<()> {
         let bytes = conn_name.as_bytes();
         let len = bytes.len() as u16;
-        pipe.write_all(&len.to_le_bytes()).await?;
-        pipe.write_all(bytes).await?;
-        pipe.flush().await?;
+        pipe.write_all(&len.to_le_bytes())
+            .await
+            .map_err(bootstrap_error)?;
+        pipe.write_all(bytes).await.map_err(bootstrap_error)?;
+        pipe.flush().await.map_err(bootstrap_error)?;
         Ok(())
     }
 
     async fn recv_conn_name(pipe: &mut NamedPipeClient) -> Result<String> {
         let mut len_buf = [0u8; 2];
-        pipe.read_exact(&mut len_buf).await?;
+        pipe.read_exact(&mut len_buf)
+            .await
+            .map_err(bootstrap_error)?;
         let len = u16::from_le_bytes(len_buf) as usize;
 
         let mut buf = vec![0u8; len];
-        pipe.read_exact(&mut buf).await?;
+        pipe.read_exact(&mut buf).await.map_err(bootstrap_error)?;
         String::from_utf8(buf)
             .map_err(|err| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))
     }

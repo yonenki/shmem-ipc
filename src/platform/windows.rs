@@ -1,4 +1,5 @@
 use std::io;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
@@ -15,8 +16,8 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
-    CreateWaitableTimerExW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, SetEvent,
-    SetWaitableTimerEx, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
+    CreateWaitableTimerExW, GetCurrentProcessId, OpenProcess, SetEvent, SetWaitableTimerEx,
+    TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
 };
 #[cfg(feature = "tokio")]
 use windows_sys::Win32::System::Threading::{RegisterWaitForSingleObject, UnregisterWaitEx};
@@ -415,20 +416,88 @@ pub fn current_pid() -> u64 {
     unsafe { GetCurrentProcessId() as u64 }
 }
 
-#[allow(dead_code)]
-pub fn is_process_alive(pid: u64) -> bool {
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
+/// Open only the wait right. Access-denied and resource failures are I/O
+/// failures, not evidence that the process disappeared.
+pub(crate) struct PeerProcess(OwnedHandle);
 
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
-        if handle.is_null() {
-            return false;
+impl PeerProcess {
+    pub(crate) fn from_pipe(pipe: &impl AsRawHandle, server: bool) -> crate::error::Result<Self> {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::System::Pipes::{
+            GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+        };
+        use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+
+        let mut pid = 0;
+        let ok = unsafe {
+            if server {
+                GetNamedPipeClientProcessId(pipe.as_raw_handle() as HANDLE, &mut pid)
+            } else {
+                GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &mut pid)
+            }
+        };
+        if ok == 0 {
+            return Err(crate::listener::bootstrap_error(io::Error::last_os_error()));
         }
+        if pid == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "peer PID unavailable").into());
+        }
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            let err = io::Error::last_os_error();
+            // A nonzero kernel-reported pipe PID with no process object has
+            // vanished. In particular, ERROR_ACCESS_DENIED must stay Io.
+            return Err(
+                if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                    crate::error::Error::PeerDisconnected
+                } else {
+                    err.into()
+                },
+            );
+        }
+        Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle as _) }))
+    }
 
-        let mut exit_code: u32 = 0;
-        let ok = GetExitCodeProcess(handle, &mut exit_code);
-        CloseHandle(handle);
-        ok != 0 && exit_code == STILL_ACTIVE
+    pub(crate) fn check_ready(&self) -> crate::error::Result<()> {
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle() as HANDLE, 0) } {
+            WAIT_TIMEOUT => Ok(()),
+            WAIT_OBJECT_0 => Err(crate::error::Error::PeerDisconnected),
+            WAIT_FAILED => Err(io::Error::last_os_error().into()),
+            _ => Err(io::Error::other("unexpected process wait status").into()),
+        }
+    }
+
+    pub(crate) fn wait(&self, cancel: &PeerCancellation) -> io::Result<super::peer::PeerWait> {
+        let handles = [
+            cancel.0.as_raw_handle() as HANDLE,
+            self.0.as_raw_handle() as HANDLE,
+        ];
+        let result =
+            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+        match result {
+            WAIT_OBJECT_0 => Ok(super::peer::PeerWait::Cancelled),
+            value if value == WAIT_OBJECT_0 + 1 => Ok(super::peer::PeerWait::Exited),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other("unexpected process wait status")),
+        }
+    }
+}
+
+pub(crate) struct PeerCancellation(OwnedHandle);
+
+impl PeerCancellation {
+    pub(crate) fn new() -> io::Result<Self> {
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { OwnedHandle::from_raw_handle(event as _) }))
+    }
+
+    pub(crate) fn cancel(&self) -> io::Result<()> {
+        if unsafe { SetEvent(self.0.as_raw_handle() as HANDLE) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }

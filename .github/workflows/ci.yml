@@ -37,7 +37,7 @@ jobs:
         run: cargo build --release
 
       - name: Unit & integration tests
-        run: cargo test -- --test-threads=1
+        run: cargo test --features tokio -- --test-threads=1
 
       - name: Stress tests
         run: cargo run --release --example stress

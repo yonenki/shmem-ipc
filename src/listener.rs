@@ -4,6 +4,79 @@ use crate::channel::{Channel, ChannelConfig};
 use crate::connection::ShmemConnection;
 use crate::error::{Error, Result};
 
+// Server acquires/arms its peer identity before sending the name. Client
+// acquires/arms its identity before replying, then waits for the server's ack.
+// Neither ack can have been buffered before the receiver acquired its identity.
+pub(crate) const CLIENT_READY: u8 = 1;
+pub(crate) const SERVER_READY: u8 = 2;
+
+pub(crate) fn bootstrap_error(err: std::io::Error) -> Error {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+        };
+        if matches!(err.raw_os_error(),
+            Some(code) if code == ERROR_BROKEN_PIPE as i32
+                || code == ERROR_NO_DATA as i32
+                || code == ERROR_PIPE_NOT_CONNECTED as i32)
+        {
+            return Error::PeerDisconnected;
+        }
+    }
+    match err.kind() {
+        std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected => Error::PeerDisconnected,
+        _ => Error::Io(err),
+    }
+}
+
+pub(crate) fn check_ack(actual: u8, expected: u8) -> Result<()> {
+    if actual != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid connection acknowledgement",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn send_ack(stream: &mut impl std::io::Write, ack: u8) -> Result<()> {
+    stream.write_all(&[ack]).map_err(bootstrap_error)?;
+    stream.flush().map_err(bootstrap_error)?;
+    Ok(())
+}
+
+fn recv_ack(stream: &mut impl std::io::Read, expected: u8) -> Result<()> {
+    let mut ack = [0];
+    stream.read_exact(&mut ack).map_err(bootstrap_error)?;
+    check_ack(ack[0], expected)
+}
+
+fn send_conn_name(stream: &mut impl std::io::Write, name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    let len = bytes.len() as u16;
+    stream
+        .write_all(&len.to_le_bytes())
+        .map_err(bootstrap_error)?;
+    stream.write_all(bytes).map_err(bootstrap_error)?;
+    stream.flush().map_err(bootstrap_error)?;
+    Ok(())
+}
+
+fn recv_conn_name(stream: &mut impl std::io::Read) -> Result<String> {
+    let mut len_buf = [0; 2];
+    stream.read_exact(&mut len_buf).map_err(bootstrap_error)?;
+    let mut bytes = vec![0; u16::from_le_bytes(len_buf) as usize];
+    stream.read_exact(&mut bytes).map_err(bootstrap_error)?;
+    String::from_utf8(bytes)
+        .map_err(|err| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))
+}
+
 /// ハンドシェイク用ソケットのパス
 #[cfg(unix)]
 fn handshake_path(name: &str) -> std::path::PathBuf {
@@ -26,7 +99,6 @@ fn handshake_path(name: &str) -> std::path::PathBuf {
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     pub struct Listener {
@@ -79,23 +151,16 @@ mod imp {
         }
 
         fn handshake(&mut self, mut stream: UnixStream) -> Result<ShmemConnection> {
-            // 1. ユニークな接続名を生成
+            let peer = crate::platform::PeerProcess::from_socket(&stream)?;
             let conn_name = format!("{}.conn.{}", self.name, self.counter);
             self.counter += 1;
-
-            // 2. データ Channel を Server として作成
-            let channel = Channel::create_with_config(&conn_name, self.config.clone())?;
-
-            // 3. 接続名をクライアントに送信
-            //    フォーマット: [len:u16 LE][name bytes]
-            let name_bytes = conn_name.as_bytes();
-            let len = name_bytes.len() as u16;
-            stream.write_all(&len.to_le_bytes())?;
-            stream.write_all(name_bytes)?;
-            stream.flush()?;
-
-            // 4. Channel を ShmemConnection に変換
-            Ok(channel.into_connection())
+            let connection = Channel::create_with_config(&conn_name, self.config.clone())?
+                .into_connection()
+                .watch_peer(peer)?;
+            send_conn_name(&mut stream, &conn_name)?;
+            recv_ack(&mut stream, CLIENT_READY)?;
+            send_ack(&mut stream, SERVER_READY)?;
+            Ok(connection)
         }
 
         pub fn cleanup(name: &str) {
@@ -116,7 +181,7 @@ mod imp {
 
         // Server の listen を待つためリトライ
         let deadline = std::time::Instant::now() + config.connect_timeout;
-        let stream = loop {
+        let mut stream = loop {
             match UnixStream::connect(&path) {
                 Ok(s) => break s,
                 Err(_) if std::time::Instant::now() < deadline => {
@@ -126,36 +191,25 @@ mod imp {
             }
         };
 
-        // 接続名を受信
-        let conn_name = read_conn_name(stream)?;
-
-        // データ Channel に Client として接続
-        let channel = Channel::open_with_config(&conn_name, config)?;
-        Ok(channel.into_connection())
-    }
-
-    fn read_conn_name(mut stream: UnixStream) -> Result<String> {
-        let mut len_buf = [0u8; 2];
-        stream.read_exact(&mut len_buf)?;
-        let len = u16::from_le_bytes(len_buf) as usize;
-
-        let mut name_buf = vec![0u8; len];
-        stream.read_exact(&mut name_buf)?;
-
-        String::from_utf8(name_buf)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+        let peer = crate::platform::PeerProcess::from_socket(&stream)?;
+        let conn_name = recv_conn_name(&mut stream)?;
+        let connection = Channel::open_with_config(&conn_name, config)?
+            .into_connection()
+            .watch_peer(peer)?;
+        send_ack(&mut stream, CLIENT_READY)?;
+        recv_ack(&mut stream, SERVER_READY)?;
+        Ok(connection)
     }
 }
 
 // =========================================================================
-// Windows 実装 (stub — 将来 Named Pipe で実装)
+// Windows 実装 (Named Pipe bootstrap)
 // =========================================================================
 
 #[cfg(windows)]
 mod imp {
     use super::*;
     use std::fs::File;
-    use std::io::{Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread::JoinHandle;
@@ -203,7 +257,7 @@ mod imp {
         if ok == 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-                return Err(err.into());
+                return Err(bootstrap_error(err));
             }
         }
 
@@ -238,25 +292,6 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-    }
-
-    fn send_conn_name(pipe: &mut File, name: &str) -> Result<()> {
-        let bytes = name.as_bytes();
-        let len = bytes.len() as u16;
-        pipe.write_all(&len.to_le_bytes())?;
-        pipe.write_all(bytes)?;
-        pipe.flush()?;
-        Ok(())
-    }
-
-    fn recv_conn_name(pipe: &mut File) -> Result<String> {
-        let mut len_buf = [0u8; 2];
-        pipe.read_exact(&mut len_buf)?;
-        let len = u16::from_le_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        pipe.read_exact(&mut buf)?;
-        String::from_utf8(buf)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
 
     struct PendingAccept {
@@ -314,12 +349,16 @@ mod imp {
         }
 
         fn handshake(&mut self, pipe: &mut File) -> Result<ShmemConnection> {
+            let peer = crate::platform::PeerProcess::from_pipe(pipe, true)?;
             let conn_name = format!("{}.conn.{}", self.name, self.counter);
             self.counter += 1;
-
-            let channel = Channel::create_with_config(&conn_name, self.config.clone())?;
+            let connection = Channel::create_with_config(&conn_name, self.config.clone())?
+                .into_connection()
+                .watch_peer(peer)?;
             send_conn_name(pipe, &conn_name)?;
-            Ok(channel.into_connection())
+            recv_ack(pipe, CLIENT_READY)?;
+            send_ack(pipe, SERVER_READY)?;
+            Ok(connection)
         }
 
         fn ensure_pending_accept(&mut self) -> Result<()> {
@@ -410,9 +449,14 @@ mod imp {
     pub fn connect_to(name: &str, config: ChannelConfig) -> Result<ShmemConnection> {
         let pipe_path = pipe_name(name);
         let mut pipe = connect_pipe(&pipe_path, config.connect_timeout)?;
+        let peer = crate::platform::PeerProcess::from_pipe(&pipe, false)?;
         let conn_name = recv_conn_name(&mut pipe)?;
-        let channel = Channel::open_with_config(&conn_name, config)?;
-        Ok(channel.into_connection())
+        let connection = Channel::open_with_config(&conn_name, config)?
+            .into_connection()
+            .watch_peer(peer)?;
+        send_ack(&mut pipe, CLIENT_READY)?;
+        recv_ack(&mut pipe, SERVER_READY)?;
+        Ok(connection)
     }
 }
 
@@ -424,6 +468,11 @@ mod imp {
 ///
 /// ハンドシェイクに Unix Socket (Linux) / Named Pipe (Windows) を使い、
 /// データ転送は SharedMem Channel で行う。
+///
+/// Both endpoints arm native process-death observation and acknowledge it before
+/// exposing a connection. `PeerDisconnected` terminates a crashed peer after
+/// committed messages drain; a published graceful close remains `ChannelClosed`.
+/// Standalone `Channel` constructors do not provide process-death observation.
 ///
 /// ```rust,no_run
 /// use shmem_ipc::{ShmemListener, ChannelConfig};

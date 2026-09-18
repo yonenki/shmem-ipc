@@ -52,6 +52,43 @@ fn main() -> shmem_ipc::Result<()> {
 }
 ```
 
+## Connection lifetime
+
+Connections returned by synchronous or Tokio `ShmemListener::accept` / `connect`
+observe the peer process through a native kernel identity: a Windows process
+handle opened with `SYNCHRONIZE`, or a Linux pidfd obtained from Unix-socket peer
+credentials. Linux listener connections require kernel support for `pidfd_open`
+(Linux 5.3 or later) and permission to use it. Unsupported, permission and resource
+errors fail setup as `Error::Io`; there is no polling or heartbeat fallback.
+
+Both endpoints acquire and arm their native observation before completing an
+ordered bootstrap exchange: the server sends the channel name, the client
+acknowledges its attachment, and the server acknowledges that reply. This keeps a
+buffered old handshake or PID reuse from establishing a watch for a different
+process generation. The bootstrap protocol requires matching library versions
+at both endpoints; the shared-memory header and ring record format are unchanged.
+
+- A crashed peer wakes idle receives and backpressured sends with
+  `Error::PeerDisconnected`, including already-pending Tokio operations.
+- Fully committed messages remain readable in order before the terminal error.
+  `recv_many` returns an already-collected batch successfully and reports the
+  terminal error on the following call. Nonblocking `try_recv` / `drain_ready`
+  keep their existing empty-result semantics after draining.
+- A published graceful close takes precedence and returns `Error::ChannelClosed`,
+  even if the process exits immediately afterwards.
+- Split halves share one monitor. Dropping one half does not retire the other;
+  dropping the final owner synchronously cancels and joins the native wait before
+  freeing the mapping or wait objects. The monitor holds no owning connection
+  reference and never waits for application traffic.
+- Direct `Channel::create/open` and their `into_connection` conversions retain
+  their existing graceful-close-only behavior; they have no bootstrap peer
+  identity and do not install a process monitor.
+
+The consolidated `peer_death_test` target uses real child endpoints with an
+external controller deadline. Run `cargo test --features tokio --test peer_death_test`
+on both Windows and Linux to exercise crash, bootstrap failure, queued drain,
+graceful precedence, split ownership and fresh-generation behavior.
+
 ## Validation
 
 The current tree is validated with:

@@ -19,17 +19,47 @@ Current implementation:
 
 - ring send/receive paths are split into non-blocking try/peek/commit primitives
 - async `send` / `recv` / split halves are cancellation-safe with explicit commit points
-- async waits are bridged by dedicated wait threads that translate shared wait objects into Tokio task wakeups
+- Linux async waits are bridged by dedicated wait threads that translate futex notifications into Tokio task wakeups
+- Windows async ring waits use `RegisterWaitForSingleObject`
 - Unix listener/connect uses Tokio Unix sockets for the control plane
-- Windows listener/connect currently uses a dedicated worker thread around the proven sync control plane for robustness
+- Windows listener/connect uses Tokio named pipes and publishes the next pipe instance before handoff
+- Listener-created connections arm a connection-owned native process monitor before the ordered bootstrap acknowledgement, using Windows process handles or Linux pidfds
 
 Still target-only in this document:
 
 - Linux `eventfd` + FD-passing wait bridge
-- Windows `RegisterWaitForSingleObject` wait bridge
-- Windows Tokio named-pipe control plane as the primary implementation
 
 The rest of this document remains the target architecture we still want to converge toward.
+
+### Implemented peer lifetime
+
+Process lifetime is separate from ring readiness. One cancellable native wait
+belongs to the shared connection guard and survives splitting. Process exit
+latches a local `PeerDisconnected` cause, advances the existing notification
+words and wakes sync and Tokio waiters. No heartbeat, PID polling, request
+deadline, shared-header change or direct-Channel process discovery is involved.
+Windows opens only `SYNCHRONIZE`; Linux requires `pidfd_open` support. Setup and
+native wait failures retain `Error::Io`, rather than pretending the peer died.
+
+Bootstrap obtains kernel peer credentials before opening the native identity.
+The server arms observation before sending the connection name; the client arms
+its observation before replying; the server acknowledges that reply before
+either endpoint finishes its handshake. The final live-peer exchange is needed
+in addition to PID acquisition, since opening a PID alone cannot exclude reuse.
+Synchronous and Tokio endpoints use the same ordered exchange.
+
+Committed records drain before terminal receive. `recv_many` defers graceful,
+process-death and native-wait I/O terminal errors after collecting a nonempty batch;
+`try_recv` and `drain_ready` retain their nonblocking drain-only behavior.
+Published graceful close wins over process death. Cancelled futures do not clear
+the local terminal cause.
+
+Final-owner teardown cancels and joins the monitor before unmapping. This is a
+bounded ownership handoff to a native cancellation object, not an async protocol
+round trip: it never waits for the peer to exit. The worker owns only its wake
+context and kernel handles, not the connection guard. Linux async ring-bridge
+teardown also rechecks cancellation after snapshotting the notify word so a
+cancel-before-sleep race cannot leave final-owner `Drop` waiting on a futex.
 
 ## Goals
 
@@ -529,6 +559,7 @@ Public error mapping stays on `crate::Error`:
 
 - timeout -> `Error::TimedOut`
 - peer close / local drop observed by async future -> `Error::ChannelClosed`
+- listener peer process exit, after committed records drain -> `Error::PeerDisconnected`
 - bridge setup failure -> `Error::Io`
 - malformed payload / sequencing errors -> existing variants
 

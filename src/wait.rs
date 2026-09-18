@@ -105,12 +105,16 @@ impl WaitStrategy for SpinThenWait {
             fence(Ordering::SeqCst);
 
             // 宣言後にもう一度チェック (parked セット前に相手が publish した場合を拾う)
-            match condition()? {
-                Some(val) => {
+            match condition() {
+                Ok(Some(val)) => {
                     parked.store(0, Ordering::Relaxed);
                     return Ok(val);
                 }
-                None => {}
+                Ok(None) => {}
+                Err(err) => {
+                    parked.store(0, Ordering::Relaxed);
+                    return Err(err);
+                }
             }
 
             platform::wait_on_handle(handle, notify, snapshot, remaining);
