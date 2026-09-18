@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -74,6 +75,19 @@ pub(crate) enum TryPeekResult {
     Ready(PeekedMessage),
 }
 
+fn check_channel_active(state: &AtomicU32, peer: Option<&platform::PeerState>) -> Result<()> {
+    // Read the local cause before the shared state: a graceful close published
+    // before process exit must win even when the death notification races us.
+    let peer_error = peer.and_then(platform::PeerState::error);
+    match ChannelState::from_u32(state.load(Ordering::Acquire)) {
+        Some(state) if state.is_active() => match peer_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        },
+        _ => Err(Error::ChannelClosed),
+    }
+}
+
 pub struct RingSender {
     base: *mut u8,
     ring_header: *const RingHeader,
@@ -86,6 +100,7 @@ pub struct RingSender {
     next_seq: u32,
     cached_wc: u64,
     cached_rc: u64,
+    peer: Option<Arc<platform::PeerState>>,
 }
 
 unsafe impl Send for RingSender {}
@@ -113,7 +128,12 @@ impl RingSender {
             next_seq: 1,
             cached_wc: 0,
             cached_rc: 0,
+            peer: None,
         }
+    }
+
+    pub(crate) fn watch_peer(&mut self, peer: Arc<platform::PeerState>) {
+        self.peer = Some(peer);
     }
 
     pub fn send(
@@ -133,7 +153,6 @@ impl RingSender {
                     let read_cursor = self.read_cursor();
                     let reader_notify = self.reader_notify();
                     let reader_parked = self.reader_parked();
-                    let state = self.state();
 
                     let new_rc = wait.wait_until(
                         &self.reader_wait,
@@ -141,15 +160,13 @@ impl RingSender {
                         reader_parked,
                         timeout,
                         || {
+                            self.check_channel_active()?;
                             let rc = read_cursor.load(Ordering::Acquire);
                             let free = ring_data_size as u64 - (wc - rc);
                             if free >= msg_len as u64 {
                                 Ok(Some(rc))
                             } else {
-                                match ChannelState::from_u32(state.load(Ordering::Acquire)) {
-                                    Some(channel_state) if channel_state.is_active() => Ok(None),
-                                    _ => Err(Error::ChannelClosed),
-                                }
+                                Ok(None)
                             }
                         },
                     )?;
@@ -268,10 +285,7 @@ impl RingSender {
     }
 
     fn check_channel_active(&self) -> Result<()> {
-        match ChannelState::from_u32(self.state().load(Ordering::Acquire)) {
-            Some(state) if state.is_active() => Ok(()),
-            _ => Err(Error::ChannelClosed),
-        }
+        check_channel_active(self.state(), self.peer.as_deref())
     }
 }
 
@@ -286,6 +300,7 @@ pub struct RingReceiver {
     ring_mask: usize,
     expected_seq: u32,
     cached_rc: u64,
+    peer: Option<Arc<platform::PeerState>>,
 }
 
 unsafe impl Send for RingReceiver {}
@@ -312,7 +327,12 @@ impl RingReceiver {
             ring_mask: ring_data_size - 1,
             expected_seq: 1,
             cached_rc: 0,
+            peer: None,
         }
+    }
+
+    pub(crate) fn watch_peer(&mut self, peer: Arc<platform::PeerState>) {
+        self.peer = Some(peer);
     }
 
     pub fn recv(&mut self, wait: &impl WaitStrategy, timeout: Option<Duration>) -> Result<Vec<u8>> {
@@ -433,20 +453,18 @@ impl RingReceiver {
             TryPeekResult::Ready(message) => Ok(Some(message)),
             TryPeekResult::Empty => match self.check_channel_active() {
                 Ok(()) => Ok(None),
-                Err(Error::ChannelClosed) => match self.try_peek_message()? {
+                // Re-read the publication cursor after observing the terminal
+                // cause. A committed final record takes precedence over EOF.
+                Err(err) => match self.try_peek_message()? {
                     TryPeekResult::Ready(message) => Ok(Some(message)),
-                    TryPeekResult::Empty => Err(Error::ChannelClosed),
+                    TryPeekResult::Empty => Err(err),
                 },
-                Err(err) => Err(err),
             },
         }
     }
 
     pub(crate) fn check_channel_active(&self) -> Result<()> {
-        match ChannelState::from_u32(self.state().load(Ordering::Acquire)) {
-            Some(state) if state.is_active() => Ok(()),
-            _ => Err(Error::ChannelClosed),
-        }
+        check_channel_active(self.state(), self.peer.as_deref())
     }
 
     fn wait_for_message(

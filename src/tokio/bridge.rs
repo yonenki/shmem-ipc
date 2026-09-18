@@ -137,6 +137,12 @@ mod imp {
             fence(Ordering::SeqCst);
 
             let current = notify.load(Ordering::Acquire);
+            // Stop may have been published before the notify snapshot above.
+            // Recheck it before sleeping so final-owner join cannot miss it.
+            if state.stop.load(Ordering::Acquire) {
+                parked.store(0, Ordering::Relaxed);
+                break;
+            }
             if current != observed {
                 parked.store(0, Ordering::Relaxed);
                 state.notify.notify_waiters();
