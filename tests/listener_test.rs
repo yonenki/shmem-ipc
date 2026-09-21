@@ -3,6 +3,14 @@ use std::time::Duration;
 
 use shmem_ipc::{ChannelConfig, ShmemListener, connect};
 
+fn backing_path(name: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    let directory = std::path::PathBuf::from("/dev/shm");
+    #[cfg(not(target_os = "linux"))]
+    let directory = std::env::temp_dir();
+    directory.join(format!("shmem_ipc_{name}"))
+}
+
 #[test]
 fn test_single_client() {
     let name = "test_ls_single";
@@ -280,20 +288,37 @@ fn retired_halves_cannot_close_a_restarted_listener_connection() {
     let first_client = thread::spawn(move || connect(name, first_config).unwrap());
     let first_server = first_listener.accept().unwrap();
     let first_client = first_client.join().unwrap();
+    let old_path = backing_path(first_server.name());
     let (old_send, old_recv) = first_server.split();
     drop(first_listener);
+    assert!(old_path.exists());
 
     let mut listener = ShmemListener::bind(name, config.clone()).unwrap();
     let next_client = thread::spawn(move || connect(name, config).unwrap());
     let mut server = listener.accept().unwrap();
     let mut client = next_client.join().unwrap();
+    let successor_path = backing_path(server.name());
+    assert_ne!(old_path, successor_path);
     client.send(b"new request").unwrap();
     // Both mappings overlap in lifetime; neither closing nor dropping the old
     // connection may reset/unlink the replacement's data or notification objects.
     old_send.close().unwrap();
     drop(first_client);
     drop(old_send);
+    assert!(
+        old_path.exists(),
+        "the receive half still owns the old file"
+    );
+    assert!(successor_path.exists());
     drop(old_recv);
+    assert!(
+        !old_path.exists(),
+        "the final server half must reclaim its file"
+    );
+    assert!(
+        successor_path.exists(),
+        "the successor file must be preserved"
+    );
     assert_eq!(server.recv().unwrap(), b"new request");
     server.send(b"new reply").unwrap();
     assert_eq!(client.recv().unwrap(), b"new reply");

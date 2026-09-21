@@ -13,6 +13,14 @@ fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|err| err.into_inner())
 }
 
+fn backing_path(name: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    let directory = std::path::PathBuf::from("/dev/shm");
+    #[cfg(not(target_os = "linux"))]
+    let directory = std::env::temp_dir();
+    directory.join(format!("shmem_ipc_{name}"))
+}
+
 #[tokio::test]
 async fn tokio_channel_basic_send_recv() {
     let _guard = test_guard();
@@ -301,6 +309,7 @@ async fn retired_async_waiter_drop_keeps_replacement_connection_alive() {
         tokio::spawn(async move { ipc_tokio::connect(name, first_config).await.unwrap() });
     let first_server = first_listener.accept().await.unwrap();
     let first_client = first_client.await.unwrap();
+    let old_path = backing_path(first_server.name());
     let (old_send, mut old_recv) = first_server.split();
     // Register a native wait, then cancel only its future. The old receive half
     // and its mmap must remain valid until that waiter's later drop.
@@ -309,6 +318,7 @@ async fn retired_async_waiter_drop_keeps_replacement_connection_alive() {
         Err(Error::TimedOut)
     ));
     drop(first_listener);
+    assert!(old_path.exists());
 
     let mut listener = ipc_tokio::ShmemListener::bind(name, config.clone())
         .await
@@ -316,11 +326,26 @@ async fn retired_async_waiter_drop_keeps_replacement_connection_alive() {
     let client = tokio::spawn(async move { ipc_tokio::connect(name, config).await.unwrap() });
     let mut server = listener.accept().await.unwrap();
     let mut client = client.await.unwrap();
+    let successor_path = backing_path(server.name());
+    assert_ne!(old_path, successor_path);
     client.send(b"new request").await.unwrap();
     old_send.close().unwrap();
     drop(first_client);
     drop(old_send);
+    assert!(
+        old_path.exists(),
+        "the cancelled waiter still owns its mapping"
+    );
+    assert!(successor_path.exists());
     drop(old_recv);
+    assert!(
+        !old_path.exists(),
+        "the final async half must reclaim its file"
+    );
+    assert!(
+        successor_path.exists(),
+        "the successor file must be preserved"
+    );
     assert_eq!(server.recv().await.unwrap(), b"new request");
     server.send(b"new reply").await.unwrap();
     assert_eq!(client.recv().await.unwrap(), b"new reply");

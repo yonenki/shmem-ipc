@@ -152,7 +152,7 @@ impl ShmemConnection {
     }
 
     pub fn name(&self) -> &str {
-        &self.shared.name
+        self.shared.name()
     }
 
     #[cfg(feature = "tokio")]

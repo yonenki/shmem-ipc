@@ -406,6 +406,13 @@ mod tests {
             client.send(b"still dead"),
             Err(Error::PeerDisconnected)
         ));
+        let path = platform::shm_path(&name);
+        drop(client);
+        // PeerDisconnected came from the live server's observation of the
+        // client identity, not from the client's server process observer.
+        assert!(path.exists(), "a live server still owns its backing file");
+        drop(server);
+        assert!(!path.exists(), "the final server owner reclaims its file");
     }
 
     #[test]

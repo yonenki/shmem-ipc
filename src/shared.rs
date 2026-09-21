@@ -16,15 +16,15 @@ const PROBE_INTERVAL_MS: u64 = 100;
 /// Rings and async wait targets each retain this owner. No raw mmap pointer can
 /// outlive it, including a Unix waiter thread or a cancelled Tokio future.
 pub(crate) struct SharedChannel {
-    pub(crate) name: String,
     pub(crate) role: Role,
     pub(crate) wait_set: platform::ChannelWaitSet,
     peer: Mutex<Option<ProcessMonitor>>,
     started: Instant,
     connect_timeout: Duration,
     next_probe_ms: AtomicU64,
-    // Last: native observers/wait objects are released before the mapping.
+    // Drop order: native observers/wait objects, then mmap, then backing file.
     mmap: MmapMut,
+    backing_file: BackingFile,
 }
 
 impl SharedChannel {
@@ -37,7 +37,6 @@ impl SharedChannel {
         peer: Option<ProcessMonitor>,
     ) -> Self {
         Self {
-            name,
             role,
             wait_set,
             peer: Mutex::new(peer),
@@ -45,7 +44,15 @@ impl SharedChannel {
             connect_timeout,
             next_probe_ms: AtomicU64::new(0),
             mmap,
+            backing_file: BackingFile {
+                name,
+                remove_on_drop: false,
+            },
         }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.backing_file.name
     }
 
     pub(crate) fn base(&self) -> *mut u8 {
@@ -205,9 +212,29 @@ impl SharedChannel {
 impl Drop for SharedChannel {
     fn drop(&mut self) {
         self.finish(ChannelState::Closed);
-        if self.role == Role::Server {
-            // Listener connection names contain the process birth and listener
-            // incarnation; a retired half can only unlink its own generation.
+        // The shared terminal cause can be written by either process. Only our
+        // retained, birth-verified server observer can authorize client cleanup,
+        // including a final drop with no I/O poll after the server exited.
+        self.backing_file.remove_on_drop = self.role == Role::Server
+            || self
+                .peer
+                .get_mut()
+                .ok()
+                .and_then(|peer| peer.as_ref())
+                .is_some_and(|peer| matches!(peer.is_alive(), Ok(false)));
+    }
+}
+
+struct BackingFile {
+    name: String,
+    remove_on_drop: bool,
+}
+
+impl Drop for BackingFile {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            // Listener names identify one process birth and listener incarnation.
+            // This guard runs after the mmap is released, including on Windows.
             let _ = std::fs::remove_file(platform::shm_path(&self.name));
         }
     }

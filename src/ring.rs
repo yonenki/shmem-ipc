@@ -82,7 +82,6 @@ pub(crate) enum TryPeekResult {
 pub struct RingSender {
     base: *mut u8,
     ring_header: *const RingHeader,
-    shared: Arc<SharedChannel>,
     writer_wait: platform::WaitHandle,
     reader_wait: platform::WaitHandle,
     data_offset: usize,
@@ -91,6 +90,8 @@ pub struct RingSender {
     next_seq: u32,
     cached_wc: u64,
     cached_rc: u64,
+    // Release native wait handles before the final mapping owner.
+    shared: Arc<SharedChannel>,
 }
 
 unsafe impl Send for RingSender {}
@@ -109,7 +110,6 @@ impl RingSender {
         Self {
             base,
             ring_header,
-            shared,
             writer_wait,
             reader_wait,
             data_offset,
@@ -118,6 +118,7 @@ impl RingSender {
             next_seq: 1,
             cached_wc: 0,
             cached_rc: 0,
+            shared,
         }
     }
 
@@ -277,7 +278,6 @@ impl RingSender {
 pub struct RingReceiver {
     base: *const u8,
     ring_header: *const RingHeader,
-    shared: Arc<SharedChannel>,
     writer_wait: platform::WaitHandle,
     reader_wait: platform::WaitHandle,
     data_offset: usize,
@@ -285,6 +285,8 @@ pub struct RingReceiver {
     ring_mask: usize,
     expected_seq: u32,
     cached_rc: u64,
+    // Release native wait handles before the final mapping owner.
+    shared: Arc<SharedChannel>,
 }
 
 unsafe impl Send for RingReceiver {}
@@ -303,7 +305,6 @@ impl RingReceiver {
         Self {
             base,
             ring_header,
-            shared,
             writer_wait,
             reader_wait,
             data_offset,
@@ -311,6 +312,7 @@ impl RingReceiver {
             ring_mask: ring_data_size - 1,
             expected_seq: 1,
             cached_rc: 0,
+            shared,
         }
     }
 

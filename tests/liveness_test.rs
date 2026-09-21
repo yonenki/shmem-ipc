@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use shmem_ipc::{Channel, ChannelConfig, Error, Role, SpinThenWait};
+use shmem_ipc::{Channel, ChannelConfig, Error, Role, ShmemListener, SpinThenWait, connect};
 
 fn config() -> ChannelConfig {
     ChannelConfig {
@@ -25,24 +25,25 @@ fn unique_name() -> String {
     )
 }
 
+fn backing_path(name: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    let directory = std::path::PathBuf::from("/dev/shm");
+    #[cfg(not(target_os = "linux"))]
+    let directory = std::env::temp_dir();
+    directory.join(format!("shmem_ipc_{name}"))
+}
+
 struct Peer {
     child: Child,
     name: String,
 }
 
 impl Peer {
-    fn spawn(name: &str, role: Role) -> Self {
+    fn spawn(name: &str, mode: &str) -> Self {
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "peer_process", "--ignored", "--nocapture"])
             .env("SHMEM_LIVENESS_NAME", name)
-            .env(
-                "SHMEM_LIVENESS_ROLE",
-                if role == Role::Server {
-                    "server"
-                } else {
-                    "client"
-                },
-            )
+            .env("SHMEM_LIVENESS_ROLE", mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -80,10 +81,20 @@ impl Drop for Peer {
 #[ignore = "child process entry, launched by the liveness regressions"]
 fn peer_process() {
     let name = std::env::var("SHMEM_LIVENESS_NAME").unwrap();
-    let mut channel = if std::env::var("SHMEM_LIVENESS_ROLE").unwrap() == "server" {
-        Channel::create_with_config(&name, config()).unwrap()
-    } else {
-        Channel::open_with_config(&name, config()).unwrap()
+    let mut channel = match std::env::var("SHMEM_LIVENESS_ROLE").unwrap().as_str() {
+        "server" => Channel::create_with_config(&name, config())
+            .unwrap()
+            .into_connection(),
+        "client" => Channel::open_with_config(&name, config())
+            .unwrap()
+            .into_connection(),
+        "listener" => {
+            // Only one accepted connection is needed; retire the handshake
+            // endpoint before a successor binds the same listener name.
+            let mut listener = ShmemListener::bind(&name, config()).unwrap();
+            listener.accept().unwrap()
+        }
+        mode => panic!("unexpected child mode: {mode}"),
     };
     assert_eq!(channel.recv().unwrap(), b"hello");
     channel.send(b"ready").unwrap();
@@ -102,10 +113,10 @@ fn pair(local_role: Role) -> (Peer, Channel) {
     let (peer, mut local) = match local_role {
         Role::Server => {
             let local = Channel::create_with_config(&name, config()).unwrap();
-            (Peer::spawn(&name, Role::Client), local)
+            (Peer::spawn(&name, "client"), local)
         }
         Role::Client => {
-            let peer = Peer::spawn(&name, Role::Server);
+            let peer = Peer::spawn(&name, "server");
             let local = Channel::open_with_config(&name, config()).unwrap();
             (peer, local)
         }
@@ -139,6 +150,7 @@ impl Termination {
 
 fn sync_split_waits(local_role: Role, termination: Termination) {
     let (mut peer, local) = pair(local_role);
+    let path = backing_path(&peer.name);
     let (mut send, mut recv) = local.into_connection().split();
     send.send(&[7; 248]).unwrap(); // exactly fill the ring; the child never drains it
     let (started_tx, started_rx) = mpsc::channel();
@@ -180,6 +192,16 @@ fn sync_split_waits(local_role: Role, termination: Termination) {
     }
     send_thread.join().unwrap();
     recv_thread.join().unwrap();
+    assert!(path.exists(), "retained halves still own {path:?}");
+    drop(send);
+    assert!(path.exists(), "the receive half still owns {path:?}");
+    drop(recv);
+    // Assert production cleanup before Peer::drop performs fixture cleanup.
+    if matches!(termination, Termination::Kill) {
+        assert!(!path.exists(), "the final owner must reclaim {path:?}");
+    } else if local_role == Role::Client {
+        assert!(path.exists(), "the live server still owns {path:?}");
+    }
 }
 
 #[test]
@@ -205,6 +227,7 @@ fn sync_split_client_close_remains_normal_close() {
 #[test]
 fn sync_channel_detects_peer_death_without_split() {
     let (mut peer, mut local) = pair(Role::Client);
+    let path = backing_path(&peer.name);
     peer.kill();
     let start = Instant::now();
     Termination::Kill.assert_error(local.recv_timeout(Duration::from_secs(2)));
@@ -212,6 +235,52 @@ fn sync_channel_detects_peer_death_without_split() {
     Termination::Kill.assert_error(local.send(b"dead"));
     Termination::Kill.assert_error(local.try_recv());
     Termination::Kill.assert_error(local.close());
+    assert!(path.exists());
+    drop(local);
+    assert!(!path.exists(), "reclamation must precede Peer::drop");
+}
+
+#[test]
+fn killed_listener_reclaims_after_last_client_half_without_an_io_poll() {
+    let name = unique_name();
+    let mut peer = Peer::spawn(&name, "listener");
+    let mut local = connect(&name, config()).unwrap();
+    peer.name = local.name().to_owned();
+    let old_path = backing_path(local.name());
+    local.send(b"hello").unwrap();
+    assert_eq!(local.recv().unwrap(), b"ready");
+    let (old_send, old_recv) = local.split();
+    peer.kill();
+    assert!(old_path.exists(), "the retained halves still need the file");
+
+    let mut listener = ShmemListener::bind(&name, config()).unwrap();
+    let client_name = name.clone();
+    let client = std::thread::spawn(move || connect(&client_name, config()).unwrap());
+    let mut server = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+    let mut client = client.join().unwrap();
+    let successor_path = backing_path(server.name());
+    assert_ne!(old_path, successor_path);
+    client.send(b"new request").unwrap();
+
+    // No operation on either old half observes the death. Final-owner teardown
+    // must probe its retained process observer, not depend on an earlier poll.
+    drop(old_send);
+    assert!(
+        old_path.exists(),
+        "the receive half still needs its mapping"
+    );
+    assert!(successor_path.exists());
+    drop(old_recv);
+    assert!(!old_path.exists(), "reclamation must precede Peer::drop");
+    assert!(
+        successor_path.exists(),
+        "the successor file must be preserved"
+    );
+    assert_eq!(server.recv().unwrap(), b"new request");
+    server.send(b"new reply").unwrap();
+    assert_eq!(client.recv().unwrap(), b"new reply");
+    client.send(b"still connected").unwrap();
+    assert_eq!(server.recv().unwrap(), b"still connected");
 }
 
 #[cfg(feature = "tokio")]
@@ -226,10 +295,10 @@ mod async_cases {
                 let local = ipc::Channel::create_with_config(&name, config())
                     .await
                     .unwrap();
-                (Peer::spawn(&name, Role::Client), local)
+                (Peer::spawn(&name, "client"), local)
             }
             Role::Client => {
-                let peer = Peer::spawn(&name, Role::Server);
+                let peer = Peer::spawn(&name, "server");
                 let local = ipc::Channel::open_with_config(&name, config())
                     .await
                     .unwrap();
@@ -243,6 +312,7 @@ mod async_cases {
 
     async fn split_waits(local_role: Role, termination: Termination) {
         let (mut peer, local) = pair(local_role).await;
+        let path = backing_path(&peer.name);
         let (mut send, mut recv) = local.into_connection().split();
         send.send(&[7; 248]).await.unwrap();
         let send_task = tokio::spawn(async move {
@@ -283,6 +353,16 @@ mod async_cases {
                 termination.assert_error(recv.close());
             }
         }
+        assert!(path.exists(), "retained halves still own {path:?}");
+        drop(send);
+        assert!(path.exists(), "the receive waiter still owns {path:?}");
+        drop(recv);
+        // The native wait registrations/bridge must be gone before unlinking.
+        if matches!(termination, Termination::Kill) {
+            assert!(!path.exists(), "the final owner must reclaim {path:?}");
+        } else if local_role == Role::Client {
+            assert!(path.exists(), "the live server still owns {path:?}");
+        }
     }
 
     #[tokio::test]
@@ -308,6 +388,7 @@ mod async_cases {
     #[tokio::test]
     async fn channel_and_connection_preserve_death_after_conversion() {
         let (mut peer, mut local) = pair(Role::Client).await;
+        let path = backing_path(&peer.name);
         peer.kill();
         Termination::Kill.assert_error(
             tokio::time::timeout(Duration::from_secs(1), local.recv())
@@ -319,5 +400,8 @@ mod async_cases {
         Termination::Kill.assert_error(connection.send(b"dead").await);
         Termination::Kill.assert_error(connection.recv().await);
         Termination::Kill.assert_error(connection.close());
+        assert!(path.exists());
+        drop(connection);
+        assert!(!path.exists(), "reclamation must precede Peer::drop");
     }
 }
