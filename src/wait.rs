@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::platform;
+use crate::shared::LIVENESS_QUANTUM;
 
 /// ブロッキング戦略の trait
 pub trait WaitStrategy: Send + Sync {
@@ -63,6 +64,7 @@ impl WaitStrategy for SpinThenWait {
     where
         F: Fn() -> Result<Option<T>>,
     {
+        let deadline = timeout.map(|d| Instant::now() + d);
         // Phase 1: Spin (syscall なし、最低レイテンシ)
         for _ in 0..self.spin_count {
             match condition()? {
@@ -72,7 +74,6 @@ impl WaitStrategy for SpinThenWait {
         }
 
         // Phase 2: Futex (parked フラグで相手に通知)
-        let deadline = timeout.map(|d| Instant::now() + d);
         loop {
             let snapshot = notify.load(Ordering::Acquire);
 
@@ -87,9 +88,9 @@ impl WaitStrategy for SpinThenWait {
                     if now >= dl {
                         return Err(Error::TimedOut);
                     }
-                    Some(dl - now)
+                    Some((dl - now).min(LIVENESS_QUANTUM))
                 }
-                None => None,
+                None => Some(LIVENESS_QUANTUM),
             };
 
             // parked = 1: 「自分は寝る」と宣言
@@ -105,12 +106,16 @@ impl WaitStrategy for SpinThenWait {
             fence(Ordering::SeqCst);
 
             // 宣言後にもう一度チェック (parked セット前に相手が publish した場合を拾う)
-            match condition()? {
-                Some(val) => {
+            match condition() {
+                Ok(Some(val)) => {
                     parked.store(0, Ordering::Relaxed);
                     return Ok(val);
                 }
-                None => {}
+                Ok(None) => {}
+                Err(error) => {
+                    parked.store(0, Ordering::Relaxed);
+                    return Err(error);
+                }
             }
 
             platform::wait_on_handle(handle, notify, snapshot, remaining);

@@ -5,7 +5,7 @@ use std::fmt;
 pub enum Error {
     /// 操作がタイムアウトした
     TimedOut,
-    /// 相手プロセスが切断された (クラッシュまたは正常終了)
+    /// 相手プロセスの終了または birth identity の不一致を確認した
     PeerDisconnected,
     /// メッセージがリングバッファの容量を超えている
     MessageTooLarge { size: usize, max: usize },
@@ -13,6 +13,8 @@ pub enum Error {
     ChannelClosed,
     /// 共有メモリファイルのヘッダが不正 (magic/version 不一致)
     InvalidHeader,
+    /// この OS では birth-aware process observation を利用できない
+    UnsupportedPlatform,
     /// シーケンス番号の不一致 (データ破損またはメッセージ欠落)
     SequenceMismatch { expected: u32, got: u32 },
     /// OS レベルの I/O エラー
@@ -29,6 +31,9 @@ impl fmt::Display for Error {
             }
             Error::ChannelClosed => write!(f, "channel closed"),
             Error::InvalidHeader => write!(f, "invalid shared memory header"),
+            Error::UnsupportedPlatform => {
+                write!(f, "birth-aware process observation is unsupported")
+            }
             Error::SequenceMismatch { expected, got } => {
                 write!(f, "sequence mismatch: expected {expected}, got {got}")
             }

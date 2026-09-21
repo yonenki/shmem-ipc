@@ -4,6 +4,7 @@ use crate::channel::ChannelConfig;
 use crate::error::{Error, Result};
 
 pub async fn connect(name: &str, config: ChannelConfig) -> Result<super::ShmemConnection> {
+    crate::platform::current_identity()?;
     Ok(super::ShmemConnection::from_sync(
         imp::connect_to(name, config).await?,
     ))
@@ -49,10 +50,12 @@ mod imp {
         name: String,
         config: ChannelConfig,
         counter: u64,
+        incarnation: String,
     }
 
     impl Listener {
         pub async fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
+            let incarnation = crate::platform::listener_incarnation()?;
             let path = handshake_path(name);
             let _ = std::fs::remove_file(&path);
             let inner = UnixListener::bind(&path)?;
@@ -61,6 +64,7 @@ mod imp {
                 name: name.to_string(),
                 config,
                 counter: 0,
+                incarnation,
             })
         }
 
@@ -82,7 +86,7 @@ mod imp {
         }
 
         async fn finish_accept(&mut self, mut stream: UnixStream) -> Result<ShmemConnection> {
-            let conn_name = format!("{}.conn.{}", self.name, self.counter);
+            let conn_name = format!("{}.conn.{}.{}", self.name, self.incarnation, self.counter);
             self.counter += 1;
 
             let channel = crate::Channel::create_with_config(&conn_name, self.config.clone())?;
@@ -122,7 +126,7 @@ mod imp {
         };
 
         let conn_name = recv_conn_name(&mut stream).await?;
-        let channel = crate::Channel::open_with_config(&conn_name, config)?;
+        let channel = crate::tokio::open_channel(&conn_name, config).await?;
         Ok(channel.into_connection())
     }
 
@@ -168,18 +172,21 @@ mod imp {
         name: String,
         config: ChannelConfig,
         counter: u64,
+        incarnation: String,
         pipe_path: String,
     }
 
     impl Listener {
         pub async fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
             let pipe_path = pipe_name(name);
+            let incarnation = crate::platform::listener_incarnation()?;
             let current = create_server(&pipe_path, true)?;
             Ok(Self {
                 current,
                 name: name.to_string(),
                 config,
                 counter: 0,
+                incarnation,
                 pipe_path,
             })
         }
@@ -216,7 +223,7 @@ mod imp {
         }
 
         async fn finish_accept(&mut self, mut pipe: NamedPipeServer) -> Result<ShmemConnection> {
-            let conn_name = format!("{}.conn.{}", self.name, self.counter);
+            let conn_name = format!("{}.conn.{}.{}", self.name, self.incarnation, self.counter);
             self.counter += 1;
 
             let channel = crate::Channel::create_with_config(&conn_name, self.config.clone())?;
@@ -243,7 +250,7 @@ mod imp {
         };
 
         let conn_name = recv_conn_name(&mut client).await?;
-        let channel = crate::Channel::open_with_config(&conn_name, config)?;
+        let channel = crate::tokio::open_channel(&conn_name, config).await?;
         Ok(channel.into_connection())
     }
 

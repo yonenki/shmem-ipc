@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 /// 共有メモリファイルのマジックナンバー ("SHMC")
 pub const MAGIC: u32 = 0x5348_4D43;
 /// プロトコルバージョン
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 1;
 /// GlobalHeader のサイズ (256 bytes に固定、将来の拡張余地を残す)
 pub const GLOBAL_HEADER_SIZE: usize = 256;
 /// RingHeader のサイズ (128 bytes = cache line 2本分)
@@ -14,7 +14,7 @@ pub const RING_HEADER_SIZE: usize = 128;
 /// チャネルの状態遷移
 ///
 /// ```text
-/// Init(0) → ServerReady(1) → Connected(2) → Closing(3) → Closed(4)
+/// Init → ServerReady → ClientClaimed → Connected → Closed / PeerDisconnected
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -23,12 +23,14 @@ pub enum ChannelState {
     Init = 0,
     /// Server がヘッダを初期化完了、Client の接続待ち
     ServerReady = 1,
-    /// Client が接続済み、通信可能
-    Connected = 2,
-    /// どちらかが切断処理を開始
-    Closing = 3,
-    /// 切断完了
+    /// Client が接続権を取得済み。identity 公開前なので通信不可
+    ClientClaimed = 2,
+    /// 双方の PID と birth identity を公開済み、通信可能
+    Connected = 3,
+    /// 正常 close
     Closed = 4,
+    /// OS identity の不一致または相手プロセスの終了を確認済み
+    PeerDisconnected = 5,
 }
 
 impl ChannelState {
@@ -36,16 +38,17 @@ impl ChannelState {
         match v {
             0 => Some(Self::Init),
             1 => Some(Self::ServerReady),
-            2 => Some(Self::Connected),
-            3 => Some(Self::Closing),
+            2 => Some(Self::ClientClaimed),
+            3 => Some(Self::Connected),
             4 => Some(Self::Closed),
+            5 => Some(Self::PeerDisconnected),
             _ => None,
         }
     }
 
     /// 通信可能な状態か
     pub fn is_active(self) -> bool {
-        matches!(self, Self::ServerReady | Self::Connected)
+        self == Self::Connected
     }
 }
 
@@ -60,10 +63,11 @@ pub struct GlobalHeader {
     pub ring_data_size: u32,
     _pad0: u32,
     pub server_pid: u64,
+    /// Windows FILETIME (100ns) / Linux /proc starttime (clock ticks).
+    pub server_birth: u64,
     pub wait_key: u64,
     pub client_pid: AtomicU64,
-    pub server_heartbeat: AtomicU64,
-    pub client_heartbeat: AtomicU64,
+    pub client_birth: AtomicU64,
     pub state: AtomicU32,
     // 残りは 256 bytes までパディング
 }

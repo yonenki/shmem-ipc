@@ -5,6 +5,7 @@ mod header;
 mod listener;
 mod platform;
 mod ring;
+mod shared;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 mod wait;

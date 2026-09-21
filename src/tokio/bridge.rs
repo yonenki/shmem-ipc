@@ -11,6 +11,7 @@ mod imp {
     use crate::error::{Error, Result};
     use crate::platform;
     use crate::ring::WaitTarget;
+    use crate::shared::LIVENESS_QUANTUM;
 
     pub(crate) struct AsyncWait {
         target: WaitTarget,
@@ -40,6 +41,8 @@ mod imp {
             self.ensure_running()?;
             let running = self.running.as_ref().expect("wait bridge missing");
             let observed = observed as u32;
+            let quantum = ::tokio::time::sleep(LIVENESS_QUANTUM);
+            ::tokio::pin!(quantum);
 
             loop {
                 let current = self.target.notify().load(Ordering::Acquire);
@@ -53,7 +56,10 @@ mod imp {
                     return Ok(());
                 }
 
-                notified.await;
+                ::tokio::select! {
+                    _ = notified => {}
+                    _ = &mut quantum => return Ok(()),
+                }
             }
         }
 
@@ -143,7 +149,7 @@ mod imp {
                 continue;
             }
 
-            platform::wait_on_handle(target.handle(), notify, observed, None);
+            platform::wait_on_handle(target.handle(), notify, observed, Some(LIVENESS_QUANTUM));
             parked.store(0, Ordering::Relaxed);
             let current = notify.load(Ordering::Acquire);
 
@@ -168,6 +174,7 @@ mod imp {
     use crate::error::{Error, Result};
     use crate::platform;
     use crate::ring::WaitTarget;
+    use crate::shared::LIVENESS_QUANTUM;
 
     pub(crate) struct AsyncWait {
         target: WaitTarget,
@@ -188,12 +195,19 @@ mod imp {
         }
 
         pub(crate) async fn wait_changed(&mut self, observed: u64) -> Result<()> {
-            WaitChanged {
-                target: &self.target,
-                observed: observed as u32,
-                armed: false,
-            }
+            match ::tokio::time::timeout(
+                LIVENESS_QUANTUM,
+                WaitChanged {
+                    target: &self.target,
+                    observed: observed as u32,
+                    armed: false,
+                },
+            )
             .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(()), // Revisit liveness; not the operation's timeout.
+            }
         }
     }
 
@@ -232,8 +246,8 @@ mod imp {
                 if !self.armed {
                     self.target.parked().store(1, Ordering::Release);
                     fence(Ordering::SeqCst);
-                    platform::prepare_wait_handle(self.target.handle()).map_err(Error::Io)?;
                     self.armed = true;
+                    platform::prepare_wait_handle(self.target.handle()).map_err(Error::Io)?;
                     continue;
                 }
 

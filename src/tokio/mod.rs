@@ -11,7 +11,7 @@ use crate::connection::{
     RecvHalf as SyncRecvHalf, SendHalf as SyncSendHalf, ShmemConnection as SyncConnection,
 };
 use crate::error::{Error, Result};
-use crate::ring::{PeekedMessage, RingReceiver, RingSender, TryPeekResult, TrySendResult};
+use crate::ring::{PeekedMessage, RingReceiver, RingSender, TrySendResult};
 
 pub use listener::{ShmemListener, connect};
 
@@ -37,10 +37,7 @@ impl Channel {
     }
 
     pub async fn open_with_config(name: &str, config: ChannelConfig) -> Result<Self> {
-        wait_for_channel_ready(name, &config).await?;
-        Ok(Self::from_sync(crate::Channel::open_with_config(
-            name, config,
-        )?))
+        Ok(Self::from_sync(open_channel(name, config).await?))
     }
 
     pub async fn send(&mut self, payload: &[u8]) -> Result<()> {
@@ -89,6 +86,10 @@ impl Channel {
     pub fn drain_ready(&mut self, out: &mut Vec<Vec<u8>>, max_messages: usize) -> Result<usize> {
         let inner = self.inner.as_mut().expect("channel already moved");
         drain_ready(inner.receiver_mut(), out, max_messages)
+    }
+
+    pub fn close(&self) -> Result<()> {
+        self.inner.as_ref().expect("channel already moved").close()
     }
 
     pub fn into_connection(mut self) -> ShmemConnection {
@@ -159,6 +160,13 @@ impl ShmemConnection {
         drain_ready(inner.receiver_mut(), out, max_messages)
     }
 
+    pub fn close(&self) -> Result<()> {
+        self.inner
+            .as_ref()
+            .expect("connection already moved")
+            .close()
+    }
+
     pub fn split(mut self) -> (SendHalf, RecvHalf) {
         self.send_wait.take();
         self.recv_wait.take();
@@ -200,6 +208,13 @@ impl SendHalf {
 
     pub async fn send_timeout(&mut self, payload: &[u8], timeout: Duration) -> Result<()> {
         map_timeout(::tokio::time::timeout(timeout, self.send(payload))).await
+    }
+
+    pub fn close(&self) -> Result<()> {
+        self.inner
+            .as_ref()
+            .expect("send half already moved")
+            .close()
     }
 
     fn from_sync(inner: SyncSendHalf) -> Self {
@@ -253,6 +268,13 @@ impl RecvHalf {
             .as_mut()
             .expect("recv half already moved")
             .try_recv()
+    }
+
+    pub fn close(&self) -> Result<()> {
+        self.inner
+            .as_ref()
+            .expect("recv half already moved")
+            .close()
     }
 
     fn from_sync(inner: SyncRecvHalf) -> Self {
@@ -381,7 +403,7 @@ fn drain_ready_with_spin(
         match spin_peek_or_closed(receiver, spin_count) {
             Ok(Some(message)) => out.push(commit_message_to_vec(receiver, message)?),
             Ok(None) => break,
-            Err(Error::ChannelClosed) if out.len() != start_len => break,
+            Err(Error::ChannelClosed | Error::PeerDisconnected) if out.len() != start_len => break,
             Err(err) => return Err(err),
         }
     }
@@ -393,14 +415,7 @@ fn drain_ready(
     out: &mut Vec<Vec<u8>>,
     max_messages: usize,
 ) -> Result<usize> {
-    let start_len = out.len();
-    while out.len() - start_len < max_messages {
-        match receiver.try_peek_message()? {
-            TryPeekResult::Ready(message) => out.push(commit_message_to_vec(receiver, message)?),
-            TryPeekResult::Empty => break,
-        }
-    }
-    Ok(out.len() - start_len)
+    drain_ready_with_spin(receiver, out, max_messages, 0)
 }
 
 fn commit_message_to_vec(receiver: &mut RingReceiver, message: PeekedMessage) -> Result<Vec<u8>> {
@@ -429,23 +444,17 @@ fn commit_message_into(
     Ok(payload_len)
 }
 
-async fn wait_for_channel_ready(name: &str, config: &ChannelConfig) -> Result<()> {
-    let path = crate::platform::shm_path(name);
-    let offsets = crate::header::RingOffsets::new(config.ring_size);
+pub(crate) async fn open_channel(name: &str, config: ChannelConfig) -> Result<crate::Channel> {
+    crate::channel::validate_config(&config)?;
+    let identity = crate::platform::current_identity()?;
     let deadline = std::time::Instant::now() + config.connect_timeout;
-
     loop {
-        if std::fs::metadata(&path)
-            .map(|metadata| metadata.len() >= offsets.total_size as u64)
-            .unwrap_or(false)
-        {
-            return Ok(());
+        if let Some(channel) = crate::Channel::try_open(name, &config, identity)? {
+            return Ok(channel);
         }
-
         if std::time::Instant::now() >= deadline {
             return Err(Error::TimedOut);
         }
-
         ::tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

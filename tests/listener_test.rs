@@ -266,3 +266,37 @@ fn test_successful_accept_primes_next_instance_before_next_poll() {
         handle.join().unwrap();
     }
 }
+
+#[test]
+fn retired_halves_cannot_close_a_restarted_listener_connection() {
+    let name = "test_ls_retired_halves";
+    ShmemListener::cleanup(name);
+    let config = ChannelConfig {
+        ring_size: 256,
+        ..ChannelConfig::default()
+    };
+    let mut first_listener = ShmemListener::bind(name, config.clone()).unwrap();
+    let first_config = config.clone();
+    let first_client = thread::spawn(move || connect(name, first_config).unwrap());
+    let first_server = first_listener.accept().unwrap();
+    let first_client = first_client.join().unwrap();
+    let (old_send, old_recv) = first_server.split();
+    drop(first_listener);
+
+    let mut listener = ShmemListener::bind(name, config.clone()).unwrap();
+    let next_client = thread::spawn(move || connect(name, config).unwrap());
+    let mut server = listener.accept().unwrap();
+    let mut client = next_client.join().unwrap();
+    client.send(b"new request").unwrap();
+    // Both mappings overlap in lifetime; neither closing nor dropping the old
+    // connection may reset/unlink the replacement's data or notification objects.
+    old_send.close().unwrap();
+    drop(first_client);
+    drop(old_send);
+    drop(old_recv);
+    assert_eq!(server.recv().unwrap(), b"new request");
+    server.send(b"new reply").unwrap();
+    assert_eq!(client.recv().unwrap(), b"new reply");
+    client.send(b"still connected").unwrap();
+    assert_eq!(server.recv().unwrap(), b"still connected");
+}

@@ -268,6 +268,7 @@ async fn tokio_recv_many_drains_available_messages() {
         client.send(b"two").unwrap();
         client.send(b"three").unwrap();
     });
+    handle.join().unwrap();
 
     let mut batch = Vec::new();
     let count = server.recv_many(&mut batch, 8).await.unwrap();
@@ -277,8 +278,50 @@ async fn tokio_recv_many_drains_available_messages() {
         vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
     );
 
-    let drained = server.drain_ready(&mut batch, 8).unwrap();
-    assert_eq!(drained, 0);
+    assert!(matches!(
+        server.drain_ready(&mut batch, 8),
+        Err(Error::ChannelClosed)
+    ));
+}
 
-    handle.join().unwrap();
+#[tokio::test]
+async fn retired_async_waiter_drop_keeps_replacement_connection_alive() {
+    let _guard = test_guard();
+    let name = "tokio_retired_waiter";
+    ShmemListener::cleanup(name);
+    let config = ChannelConfig {
+        ring_size: 256,
+        ..ChannelConfig::default()
+    };
+    let mut first_listener = ipc_tokio::ShmemListener::bind(name, config.clone())
+        .await
+        .unwrap();
+    let first_config = config.clone();
+    let first_client =
+        tokio::spawn(async move { ipc_tokio::connect(name, first_config).await.unwrap() });
+    let first_server = first_listener.accept().await.unwrap();
+    let first_client = first_client.await.unwrap();
+    let (old_send, mut old_recv) = first_server.split();
+    // Register a native wait, then cancel only its future. The old receive half
+    // and its mmap must remain valid until that waiter's later drop.
+    assert!(matches!(
+        old_recv.recv_timeout(Duration::from_millis(20)).await,
+        Err(Error::TimedOut)
+    ));
+    drop(first_listener);
+
+    let mut listener = ipc_tokio::ShmemListener::bind(name, config.clone())
+        .await
+        .unwrap();
+    let client = tokio::spawn(async move { ipc_tokio::connect(name, config).await.unwrap() });
+    let mut server = listener.accept().await.unwrap();
+    let mut client = client.await.unwrap();
+    client.send(b"new request").await.unwrap();
+    old_send.close().unwrap();
+    drop(first_client);
+    drop(old_send);
+    drop(old_recv);
+    assert_eq!(server.recv().await.unwrap(), b"new request");
+    server.send(b"new reply").await.unwrap();
+    assert_eq!(client.recv().await.unwrap(), b"new reply");
 }

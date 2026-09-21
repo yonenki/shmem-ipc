@@ -34,10 +34,12 @@ mod imp {
         name: String,
         config: ChannelConfig,
         counter: u64,
+        incarnation: String,
     }
 
     impl Listener {
         pub fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
+            let incarnation = crate::platform::listener_incarnation()?;
             let path = handshake_path(name);
             // 既存ソケットファイルを削除
             let _ = std::fs::remove_file(&path);
@@ -47,6 +49,7 @@ mod imp {
                 name: name.to_string(),
                 config,
                 counter: 0,
+                incarnation,
             })
         }
 
@@ -80,7 +83,7 @@ mod imp {
 
         fn handshake(&mut self, mut stream: UnixStream) -> Result<ShmemConnection> {
             // 1. ユニークな接続名を生成
-            let conn_name = format!("{}.conn.{}", self.name, self.counter);
+            let conn_name = format!("{}.conn.{}.{}", self.name, self.incarnation, self.counter);
             self.counter += 1;
 
             // 2. データ Channel を Server として作成
@@ -148,7 +151,7 @@ mod imp {
 }
 
 // =========================================================================
-// Windows 実装 (stub — 将来 Named Pipe で実装)
+// Windows 実装 (Named Pipe)
 // =========================================================================
 
 #[cfg(windows)]
@@ -287,17 +290,20 @@ mod imp {
         name: String,
         config: ChannelConfig,
         counter: u64,
+        incarnation: String,
         pipe_path: String,
         pending_accept: Option<PendingAccept>,
     }
 
     impl Listener {
         pub fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
+            let incarnation = crate::platform::listener_incarnation()?;
             let pipe_path = pipe_name(name);
             Ok(Self {
                 name: name.to_string(),
                 config,
                 counter: 0,
+                incarnation,
                 pipe_path,
                 pending_accept: None,
             })
@@ -314,7 +320,7 @@ mod imp {
         }
 
         fn handshake(&mut self, pipe: &mut File) -> Result<ShmemConnection> {
-            let conn_name = format!("{}.conn.{}", self.name, self.counter);
+            let conn_name = format!("{}.conn.{}.{}", self.name, self.incarnation, self.counter);
             self.counter += 1;
 
             let channel = Channel::create_with_config(&conn_name, self.config.clone())?;
@@ -462,5 +468,6 @@ impl ShmemListener {
 ///
 /// ハンドシェイク後、SharedMem Channel 上の ShmemConnection を返す。
 pub fn connect(name: &str, config: ChannelConfig) -> Result<ShmemConnection> {
+    crate::platform::current_identity()?;
     imp::connect_to(name, config)
 }

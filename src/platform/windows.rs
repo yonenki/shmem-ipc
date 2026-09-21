@@ -1,4 +1,5 @@
 use std::io;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
@@ -12,11 +13,14 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(feature = "tokio")]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
-    CreateWaitableTimerExW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, SetEvent,
-    SetWaitableTimerEx, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
+    CreateWaitableTimerExW, GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, SetWaitableTimerEx, TIMER_ALL_ACCESS,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 #[cfg(feature = "tokio")]
 use windows_sys::Win32::System::Threading::{RegisterWaitForSingleObject, UnregisterWaitEx};
@@ -415,20 +419,72 @@ pub fn current_pid() -> u64 {
     unsafe { GetCurrentProcessId() as u64 }
 }
 
-#[allow(dead_code)]
-pub fn is_process_alive(pid: u64) -> bool {
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
+/// A retained kernel process object cannot start referring to a reused PID.
+pub struct ProcessMonitor {
+    handle: OwnedHandle,
+}
 
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
-        if handle.is_null() {
-            return false;
+impl ProcessMonitor {
+    pub fn open(identity: super::ProcessIdentity) -> crate::Result<Self> {
+        if identity.pid == 0 || identity.pid > u32::MAX as u64 || identity.birth == 0 {
+            return Err(crate::Error::InvalidHeader);
         }
-
-        let mut exit_code: u32 = 0;
-        let ok = GetExitCodeProcess(handle, &mut exit_code);
-        CloseHandle(handle);
-        ok != 0 && exit_code == STILL_ACTIVE
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                0,
+                identity.pid as u32,
+            )
+        };
+        if handle.is_null() {
+            let error = io::Error::last_os_error();
+            return Err(
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                    crate::Error::PeerDisconnected
+                } else {
+                    crate::Error::Io(error)
+                },
+            );
+        }
+        let monitor = Self {
+            handle: unsafe { OwnedHandle::from_raw_handle(handle) },
+        };
+        if process_birth(handle)? != identity.birth || !monitor.is_alive()? {
+            return Err(crate::Error::PeerDisconnected);
+        }
+        Ok(monitor)
     }
+
+    pub fn is_alive(&self) -> crate::Result<bool> {
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error().into()),
+            status => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected process wait status: {status}"),
+            )
+            .into()),
+        }
+    }
+}
+
+fn process_birth(handle: HANDLE) -> io::Result<u64> {
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // FILETIME's native 100ns ticks, without conversion or precision loss.
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+pub fn current_identity() -> crate::Result<super::ProcessIdentity> {
+    Ok(super::ProcessIdentity {
+        pid: current_pid(),
+        birth: process_birth(unsafe { GetCurrentProcess() })?,
+    })
 }

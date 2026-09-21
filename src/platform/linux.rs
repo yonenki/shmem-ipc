@@ -84,11 +84,78 @@ pub fn current_pid() -> u64 {
     unsafe { libc::getpid() as u64 }
 }
 
-/// 指定した PID のプロセスが生きているかチェックする
-#[allow(dead_code)] // heartbeat 機能で使用予定
-///
-/// kill(pid, 0) はシグナルを送らずに存在確認だけ行う。
-/// プロセスが存在すれば 0 を返し、存在しなければ ESRCH で -1 を返す。
-pub fn is_process_alive(pid: u64) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+/// /proc starttime is field 22, in clock ticks since boot (not milliseconds).
+fn process_stat(pid: u64) -> crate::Result<(u64, bool)> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::Error::PeerDisconnected);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    parse_process_stat(&stat)
+}
+
+fn parse_process_stat(stat: &str) -> crate::Result<(u64, bool)> {
+    // comm may contain spaces and ')' characters.
+    let (_, fields) = stat.rsplit_once(") ").ok_or(crate::Error::InvalidHeader)?;
+    let mut fields = fields.split_whitespace();
+    let state = fields.next().ok_or(crate::Error::InvalidHeader)?;
+    let birth = fields
+        .nth(18)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(crate::Error::InvalidHeader)?;
+    Ok((birth, !matches!(state, "Z" | "X" | "x")))
+}
+
+pub struct ProcessMonitor {
+    identity: super::ProcessIdentity,
+}
+
+impl ProcessMonitor {
+    pub fn open(identity: super::ProcessIdentity) -> crate::Result<Self> {
+        if identity.pid == 0 {
+            return Err(crate::Error::InvalidHeader);
+        }
+        let monitor = Self { identity };
+        if !monitor.is_alive()? {
+            return Err(crate::Error::PeerDisconnected);
+        }
+        Ok(monitor)
+    }
+
+    pub fn is_alive(&self) -> crate::Result<bool> {
+        match process_stat(self.identity.pid) {
+            Ok((birth, alive)) => Ok(alive && birth == self.identity.birth),
+            Err(crate::Error::PeerDisconnected) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub fn current_identity() -> crate::Result<super::ProcessIdentity> {
+    let pid = current_pid();
+    let (birth, _) = process_stat(pid).map_err(|error| match error {
+        crate::Error::PeerDisconnected => crate::Error::UnsupportedPlatform,
+        other => other,
+    })?;
+    Ok(super::ProcessIdentity { pid, birth })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_birth_uses_starttime_ticks_and_recognizes_zombies() {
+        let fields = "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654321 99";
+        assert_eq!(
+            parse_process_stat(&format!("42 (worker (name)) S {fields}")).unwrap(),
+            (987654321, true)
+        );
+        assert_eq!(
+            parse_process_stat(&format!("42 (worker) Z {fields}")).unwrap(),
+            (987654321, false)
+        );
+    }
 }

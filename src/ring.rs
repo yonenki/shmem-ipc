@@ -1,9 +1,11 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::header::{ChannelState, GlobalHeader, RingHeader};
+use crate::header::RingHeader;
 use crate::platform;
+use crate::shared::SharedChannel;
 use crate::wait::WaitStrategy;
 
 pub const DEFAULT_RING_DATA_SIZE: usize = 16 * 1024 * 1024;
@@ -15,6 +17,7 @@ pub(crate) struct WaitTarget {
     handle: platform::WaitHandle,
     notify: *const AtomicU32,
     parked: *const AtomicU32,
+    _shared: Arc<SharedChannel>,
 }
 
 #[cfg(feature = "tokio")]
@@ -23,11 +26,13 @@ impl WaitTarget {
         handle: platform::WaitHandle,
         notify: *const AtomicU32,
         parked: *const AtomicU32,
+        shared: Arc<SharedChannel>,
     ) -> Self {
         Self {
             handle,
             notify,
             parked,
+            _shared: shared,
         }
     }
 
@@ -77,7 +82,7 @@ pub(crate) enum TryPeekResult {
 pub struct RingSender {
     base: *mut u8,
     ring_header: *const RingHeader,
-    global_header: *const GlobalHeader,
+    shared: Arc<SharedChannel>,
     writer_wait: platform::WaitHandle,
     reader_wait: platform::WaitHandle,
     data_offset: usize,
@@ -91,10 +96,10 @@ pub struct RingSender {
 unsafe impl Send for RingSender {}
 
 impl RingSender {
-    pub unsafe fn new(
+    pub(crate) unsafe fn new(
         base: *mut u8,
         ring_header: *const RingHeader,
-        global_header: *const GlobalHeader,
+        shared: Arc<SharedChannel>,
         writer_wait: platform::WaitHandle,
         reader_wait: platform::WaitHandle,
         data_offset: usize,
@@ -104,7 +109,7 @@ impl RingSender {
         Self {
             base,
             ring_header,
-            global_header,
+            shared,
             writer_wait,
             reader_wait,
             data_offset,
@@ -123,6 +128,7 @@ impl RingSender {
         timeout: Option<Duration>,
     ) -> Result<()> {
         let msg_len = self.message_size(payload.len())?;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
 
         loop {
             match self.try_send_once(payload)? {
@@ -133,23 +139,24 @@ impl RingSender {
                     let read_cursor = self.read_cursor();
                     let reader_notify = self.reader_notify();
                     let reader_parked = self.reader_parked();
-                    let state = self.state();
+                    let remaining =
+                        deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
 
                     let new_rc = wait.wait_until(
                         &self.reader_wait,
                         reader_notify,
                         reader_parked,
-                        timeout,
+                        remaining,
                         || {
+                            if !self.shared.check_ready()? {
+                                return Ok(None);
+                            }
                             let rc = read_cursor.load(Ordering::Acquire);
                             let free = ring_data_size as u64 - (wc - rc);
                             if free >= msg_len as u64 {
                                 Ok(Some(rc))
                             } else {
-                                match ChannelState::from_u32(state.load(Ordering::Acquire)) {
-                                    Some(channel_state) if channel_state.is_active() => Ok(None),
-                                    _ => Err(Error::ChannelClosed),
-                                }
+                                Ok(None)
                             }
                         },
                     )?;
@@ -160,7 +167,9 @@ impl RingSender {
     }
 
     pub(crate) fn try_send_once(&mut self, payload: &[u8]) -> Result<TrySendResult> {
-        self.check_channel_active()?;
+        if !self.shared.check_ready()? {
+            return Ok(TrySendResult::Full);
+        }
 
         let msg_len = self.message_size(payload.len())?;
         let wc = self.cached_wc;
@@ -183,6 +192,7 @@ impl RingSender {
             self.reader_wait.clone(),
             self.reader_notify() as *const AtomicU32,
             self.reader_parked() as *const AtomicU32,
+            Arc::clone(&self.shared),
         )
     }
 
@@ -262,23 +272,12 @@ impl RingSender {
     fn reader_parked(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).reader.parked }
     }
-
-    fn state(&self) -> &AtomicU32 {
-        unsafe { &(*self.global_header).state }
-    }
-
-    fn check_channel_active(&self) -> Result<()> {
-        match ChannelState::from_u32(self.state().load(Ordering::Acquire)) {
-            Some(state) if state.is_active() => Ok(()),
-            _ => Err(Error::ChannelClosed),
-        }
-    }
 }
 
 pub struct RingReceiver {
     base: *const u8,
     ring_header: *const RingHeader,
-    global_header: *const GlobalHeader,
+    shared: Arc<SharedChannel>,
     writer_wait: platform::WaitHandle,
     reader_wait: platform::WaitHandle,
     data_offset: usize,
@@ -291,10 +290,10 @@ pub struct RingReceiver {
 unsafe impl Send for RingReceiver {}
 
 impl RingReceiver {
-    pub unsafe fn new(
+    pub(crate) unsafe fn new(
         base: *const u8,
         ring_header: *const RingHeader,
-        global_header: *const GlobalHeader,
+        shared: Arc<SharedChannel>,
         writer_wait: platform::WaitHandle,
         reader_wait: platform::WaitHandle,
         data_offset: usize,
@@ -304,7 +303,7 @@ impl RingReceiver {
         Self {
             base,
             ring_header,
-            global_header,
+            shared,
             writer_wait,
             reader_wait,
             data_offset,
@@ -346,9 +345,9 @@ impl RingReceiver {
     }
 
     pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
-        match self.try_peek_message()? {
-            TryPeekResult::Empty => Ok(None),
-            TryPeekResult::Ready(message) => {
+        match self.try_peek_or_closed()? {
+            None => Ok(None),
+            Some(message) => {
                 let mut buf = vec![0u8; message.payload_len()];
                 self.copy_current_message(message, &mut buf)?;
                 self.commit_current_message(message)?;
@@ -425,27 +424,25 @@ impl RingReceiver {
             self.writer_wait.clone(),
             self.writer_notify() as *const AtomicU32,
             self.writer_parked() as *const AtomicU32,
+            Arc::clone(&self.shared),
         )
     }
 
     pub(crate) fn try_peek_or_closed(&self) -> Result<Option<PeekedMessage>> {
         match self.try_peek_message()? {
             TryPeekResult::Ready(message) => Ok(Some(message)),
-            TryPeekResult::Empty => match self.check_channel_active() {
-                Ok(()) => Ok(None),
-                Err(Error::ChannelClosed) => match self.try_peek_message()? {
-                    TryPeekResult::Ready(message) => Ok(Some(message)),
-                    TryPeekResult::Empty => Err(Error::ChannelClosed),
-                },
-                Err(err) => Err(err),
+            TryPeekResult::Empty => match self.shared.check_ready() {
+                Ok(_) => Ok(None),
+                Err(error @ (Error::ChannelClosed | Error::PeerDisconnected)) => {
+                    // Preserve already-published records when close/death races
+                    // the initial empty observation.
+                    match self.try_peek_message()? {
+                        TryPeekResult::Ready(message) => Ok(Some(message)),
+                        TryPeekResult::Empty => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
             },
-        }
-    }
-
-    pub(crate) fn check_channel_active(&self) -> Result<()> {
-        match ChannelState::from_u32(self.state().load(Ordering::Acquire)) {
-            Some(state) if state.is_active() => Ok(()),
-            _ => Err(Error::ChannelClosed),
         }
     }
 
@@ -523,9 +520,5 @@ impl RingReceiver {
 
     fn reader_parked(&self) -> &AtomicU32 {
         unsafe { &(*self.ring_header).reader.parked }
-    }
-
-    fn state(&self) -> &AtomicU32 {
-        unsafe { &(*self.global_header).state }
     }
 }
